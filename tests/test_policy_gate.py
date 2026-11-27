@@ -56,7 +56,7 @@ class PolicyGateTest(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.bash(cmd), "allow")
 
-    # Tier 2: ask Rosie
+    # Tier 2: ask the user
     def test_tier2_asks(self):
         for cmd in ("git push origin main", "git push --force", "git push -f origin claude/work",
                     "git push origin +claude/work", "git push origin :claude/old",

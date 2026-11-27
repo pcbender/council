@@ -274,7 +274,7 @@ def check_push(cwd: Path, args: list[str]):
     risky = {"-f", "--force", "--force-with-lease", "--force-if-includes", "--mirror", "--all",
              "--tags", "--delete", "-d", "--prune", "--repo", "--receive-pack", "--exec"}
     if risky.intersection(flags):
-        return "ask", "Force, delete, mirror, --all, --tags or --repo pushes need Rosie's approval (Tier 2)."
+        return "ask", "Force, delete, mirror, --all, --tags or --repo pushes need the user's approval (Tier 2)."
     refspecs = pos[1:]
     if not refspecs:
         code, target = git(cwd, "rev-parse", "--abbrev-ref", "@{push}")
@@ -293,10 +293,10 @@ def check_push(cwd: Path, args: list[str]):
         if dst == "HEAD":
             dst = src
         if dst in PROTECTED_BRANCHES:
-            return "ask", f"Pushing to {dst} needs Rosie's approval (Tier 2)."
+            return "ask", f"Pushing to {dst} needs the user's approval (Tier 2)."
         if not own_branch(dst):
             return "ask", (f"Pushing to {dst}, which is not a council/ or claude/ branch, "
-                           "needs Rosie's approval (Tier 2).")
+                           "needs the user's approval (Tier 2).")
     return None
 
 
@@ -310,12 +310,12 @@ def merge_size(cwd: Path, ref: str) -> int:
 def check_git(cwd: Path, sub: str, args: list[str], risky: list[str], command: str, depth: int = 0):
     if risky:
         return "ask", (f"git options {', '.join(risky)} can retarget or redefine the command; "
-                       "Rosie approves (Tier 2).")
+                       "the user approves (Tier 2).")
     if sub not in GIT_BUILTINS and depth < 3:
         code, expansion = git(cwd, "config", "--get", f"alias.{sub}")
         if code == 0 and expansion:
             if expansion.startswith("!"):
-                return "ask", f"`git {sub}` is a shell alias ({expansion}); Rosie approves (Tier 2)."
+                return "ask", f"`git {sub}` is a shell alias ({expansion}); the user approves (Tier 2)."
             words = split_words(expansion)
             return check_git(cwd, words[0], words[1:] + args, [], command, depth + 1)
     branch = current_branch(cwd)
@@ -352,7 +352,7 @@ def check_git(cwd: Path, sub: str, args: list[str], risky: list[str], command: s
         lines = sum(merge_size(cwd, ref) for ref in pos)
         if lines > MERGE_ASK_LINES:
             return "ask", (f"Merging {' '.join(pos)} brings in {lines} changed lines (over "
-                           f"{MERGE_ASK_LINES}); Rosie approves merges that large (Tier 2).")
+                           f"{MERGE_ASK_LINES}); the user approves merges that large (Tier 2).")
     if sub == "rebase" and is_pushed(cwd, branch):
         return "ask", "Rebasing a branch that has been pushed rewrites shared history (Tier 2)."
     if sub == "reset" and "--hard" in flags and is_pushed(cwd, branch):
@@ -362,19 +362,19 @@ def check_git(cwd: Path, sub: str, args: list[str], risky: list[str], command: s
                 "--copy"} & set(flags):
             if not pos or any(not n.startswith("council/") or n in PROTECTED_BRANCHES for n in pos):
                 return "ask", ("Deleting, renaming, copying or force-moving branches the council "
-                               "did not create needs Rosie (Tier 2).")
+                               "did not create needs the user's approval (Tier 2).")
     if sub == "tag" and {"-d", "--delete", "-f", "--force"} & set(flags):
-        return "ask", "Deleting or moving tags needs Rosie's approval (Tier 2)."
+        return "ask", "Deleting or moving tags needs the user's approval (Tier 2)."
     if sub == "worktree" and pos[:1] in (["remove"], ["move"]):
         targets = pos[1:]
         if not targets or any(not under_council(norm_path(t, cwd), cwd) for t in targets):
-            return "ask", "Removing or moving a worktree the council did not create needs Rosie (Tier 2)."
+            return "ask", "Removing or moving a worktree the council did not create needs the user's approval (Tier 2)."
     if sub == "clean" and ("-f" in flags or "--force" in flags) and not under_council(norm_path(".", cwd), cwd):
         return "ask", "`git clean -f` deletes untracked files in the main checkout (Tier 2)."
     if sub in ("checkout", "restore") and any(p.rstrip("/") in (".", ":", "*", ":/*", "") for p in pos) \
             and not (sub == "restore" and {"--staged", "-S"} & set(flags) and not {"--worktree", "-W"} & set(flags)) \
             and not under_council(norm_path(".", cwd), cwd):
-        return "ask", "Discarding local changes across the main checkout needs Rosie (Tier 2)."
+        return "ask", "Discarding local changes across the main checkout needs the user's approval (Tier 2)."
     if sub == "rm" and ({"-r"} & set(flags)) and any(
             not under_council(norm_path(p, cwd), cwd) for p in pos):
         return "ask", "`git rm -r` outside .council/ deletes tracked files (Tier 2)."
@@ -383,7 +383,7 @@ def check_git(cwd: Path, sub: str, args: list[str], risky: list[str], command: s
     if sub == "config" and ({"--global", "--system"} & set(flags)) and not (
             {"--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin"} & set(flags)):
         if len(pos) >= 2 or {"--unset", "--unset-all", "--add", "--replace-all", "--edit", "-e"} & set(flags):
-            return "ask", "Changing global git config needs Rosie's approval (Tier 2)."
+            return "ask", "Changing global git config needs the user's approval (Tier 2)."
     if sub == "commit":
         return commit_gate(cwd, args, flags, pos, command)
     return None
@@ -401,7 +401,7 @@ def commit_gate(cwd: Path, args, flags, pos, command: str):
         return "deny", ("Council gate: commit exactly the reviewed staged change; no -a, --include, "
                         "--only, --amend, --patch or pathspecs.")
     if command == "COUNCIL_SKIP=1":  # set by check_segment from an env prefix, not message text
-        return "ask", "COUNCIL_SKIP=1 bypasses the council commit gate; Rosie decides (Tier 2)."
+        return "ask", "COUNCIL_SKIP=1 bypasses the council commit gate; the user decides (Tier 2)."
     stamp = top / ".council" / "approved.json"
     staged = subprocess.run(["git", "-C", str(top), "diff", "--cached", "--binary"], text=True,
                             encoding="utf-8", errors="replace", capture_output=True,
@@ -428,9 +428,9 @@ def check_gh(words: list[str]):
     group, action = words[1], words[2]
     if group == "pr":
         if action in ("merge", "ready", "close", "reopen", "review"):
-            return "ask", f"`gh pr {action}` needs Rosie's approval (Tier 2)."
+            return "ask", f"`gh pr {action}` needs the user's approval (Tier 2)."
         if action == "create" and not {"--draft", "-d"} & set(words):
-            return "ask", "Only draft PRs are delegated; a ready PR needs Rosie (Tier 2)."
+            return "ask", "Only draft PRs are delegated; a ready PR needs the user's approval (Tier 2)."
     if group == "issue" and action not in GH_READ_ACTIONS:
         return "ask", f"`gh issue {action}` posts or changes things on GitHub (Tier 2)."
     if group in ("repo", "release", "secret", "variable", "workflow", "ruleset", "label", "gist",
@@ -536,12 +536,12 @@ def check_segment(segment: str, cwd: Path, command: str, depth: int = 0):
     if head == "gh":
         return check_gh(words)
     if is_install(words):
-        return "ask", "Adding, removing or upgrading dependencies needs Rosie's approval (Tier 2)."
+        return "ask", "Adding, removing or upgrading dependencies needs the user's approval (Tier 2)."
     if head in DELETE_VERBS and any(w.lower() in ("/s", "--recursive") or w.lower().startswith("-rec")
                                     or (re.match(r"^-[a-zA-Z]*[rR]", w) is not None) for w in words[1:]):
         targets = [w for w in words[1:] if not is_switch(w)]
         if not targets or any(not under_council(norm_path(t, cwd), cwd) for t in targets):
-            return "ask", "Recursive deletes outside .council/ need Rosie's approval (Tier 2)."
+            return "ask", "Recursive deletes outside .council/ need the user's approval (Tier 2)."
     return None
 
 

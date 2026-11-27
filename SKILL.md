@@ -8,10 +8,11 @@ description: Convene Codex and Gemini (via Antigravity) as a council alongside y
 You are the **chairman**. Codex and Gemini are council members you consult through
 `scripts/council.py`. They have direct access to the code, so use them for three things:
 their **opinion on how to approach** a problem, **review** of a change, and doing **hard
-tasks** in their own worktree. The user is often on their phone via Remote Control, so
+tasks** in their own worktree. The user may be following on their phone via Remote Control, so
 keep what you show them short.
 
-`SKILL_DIR` below means the folder containing this file. Run folders live in
+`SKILL_DIR` below means the folder containing this file, and `python` means whatever
+runs Python 3 on this machine (often `python3` on macOS and Linux). Run folders live in
 `.council/runs/<yyyymmdd-hhmm>-<short-slug>/` in the repo root (`.council/` must be in
 `.gitignore`; `task` refuses to run otherwise).
 
@@ -105,7 +106,7 @@ on the same brief (a bake-off) and pick or combine.
 
 ## Delegation of authority
 
-The user (Rosie) delegated these decisions to you. Follow them even when no hook is
+The user delegated these decisions to you. Follow them even when no hook is
 installed; `scripts/policy_gate.py` enforces most of them when it is.
 
 **Tier 0 — do it.** Read the repo; run any council mode; create and remove worktrees under
@@ -139,5 +140,8 @@ The runner prints `QUOTA`, `AUTH`, `FAILED` (or `DENIED`/`VIOLATION` in task mod
 note. Report it in one line and carry on with the members that answered. A failed member
 counts as "revise" at the gate, so a review can't pass with a missing reviewer.
 
-- `AUTH` on gemini: the user needs to run `agy` once interactively on the PC.
-- "pywinpty is not installed": `pip install pywinpty` (a dependency install, so ask first).
+- `AUTH` on gemini: the user needs to run `agy` once interactively on the machine that
+  runs the council.
+- `AUTH` on codex: the user needs to run `codex login` (with ChatGPT, not an API key).
+- "pywinpty is not installed" (Windows only): `pip install pywinpty` (a dependency
+  install, so ask first).

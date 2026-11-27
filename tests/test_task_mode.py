@@ -44,8 +44,10 @@ class TaskModeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.old_env = {k: os.environ.get(k) for k in ("TEMP", "TMP")}
-        os.environ["TEMP"] = os.environ["TMP"] = str(root / "elsewhere")  # see %TEMP% guard
+        self.old_env = {k: os.environ.get(k) for k in ("TEMP", "TMP", "TMPDIR")}
+        (root / "elsewhere").mkdir()
+        for k in self.old_env:  # see the temp-folder guard in council.py
+            os.environ[k] = str(root / "elsewhere")
         self.repo = root / "repo"
         self.repo.mkdir()
         sh(self.repo, "git", "init", "-q", "-b", "main")
