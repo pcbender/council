@@ -1,8 +1,14 @@
 # Council skill for Claude Code
 
-What's kept from Cantor, rebuilt as a Claude Code skill. Claude (Desktop app, Remote Control)
-is the chairman. Codex and Gemini are members on your subscription logins: read-only when
-consulted or reviewing, and confined to their own git worktree when given a task.
+Council turns Claude Code into the **chairman** of a small panel of coding agents. Codex
+(ChatGPT subscription) and Gemini (Google subscription, via the Antigravity CLI `agy`) are
+**members**: Claude asks them how they would approach a problem, has them review a staged
+change, or hands them a task to do in their own git worktree. Members run on your existing
+subscription logins, never on metered API keys.
+
+Members are read-only when consulted or reviewing, and confined to their own worktree when
+given a task. A policy hook (optional) keeps the chairman inside a delegation-of-authority
+policy, which works well when you drive Claude Code from your phone over Remote Control.
 
 ## Modes
 
@@ -12,30 +18,81 @@ consulted or reviewing, and confined to their own git worktree when given a task
 | Ask | `/council <question>` | read the repo, answer |
 | Review | `/council review` | read the staged diff, return a verdict |
 | Task | `/council task <what to do>` | edit files in `.council/worktrees/<run>-<member>` only |
+| Check | `/council check` | nothing; reports which members are ready |
 
 Run folders go in `.council/runs/`, worktrees in `.council/worktrees/`. Add `.council/` to
 the repo's `.gitignore` (task mode refuses to run without it).
 
-## What came from Cantor
+## Requirements
 
-| Cantor | Here |
-| --- | --- |
-| `CliExecutor` + `CodexCliAdapter` / `ClaudeCliAdapter` | `scripts/council.py` adapters: read-only by default, write mode for tasks |
-| `GeminiCliAdapter` (`gemini`) | Replaced by `agy` (Antigravity). Gemini CLI stopped serving AI Pro/Ultra on 2026-06-18 |
-| `assert_auth` subscription checks | `council.py check`. Refuses a member that would bill an API key |
-| `cli_env.build_subprocess_env` | `scrubbed_env()`, **fixed for Windows** |
-| `map_quota` | Quota and auth detection, reported as `QUOTA` / `AUTH` |
-| `workspace_patch_sha256` acceptance check | Diff fingerprint: a pass only counts for the exact staged change |
-| Review gate (`acceptance_ready`, blockers) | `council.py gate` + the commit gate in `policy_gate.py` |
-| Cross-vendor structured verdict (explored, never built) | JSON verdict schema, consistency rule, combine policy |
+- Claude Code (any surface: terminal, Desktop app, IDE).
+- Python 3.9 or newer. The scripts use only the standard library, except for
+  `pywinpty` on Windows (see below).
+- Git.
+- At least one member CLI, logged in with a subscription account:
+  - **Codex**: `codex` CLI, logged in with ChatGPT (`codex login`). `council.py check`
+    refuses it if it is set up with an API key.
+  - **Gemini**: Antigravity CLI `agy`, logged in by running `agy` once interactively.
+    (The older Gemini CLI no longer serves Google AI Pro/Ultra subscriptions.)
+- Windows only: `pip install pywinpty`. `agy` sometimes prints nothing when its output is
+  piped, and the runner retries under a pseudo-terminal. macOS and Linux use the stdlib
+  `pty` module, so nothing extra is needed there.
 
-## How write mode is confined (tested on Serenity, 2026-11-27)
+Disable a member you don't have in `council.config.json` (`"enabled": false`).
+
+## Install
+
+Claude Code loads skills from `~/.claude/skills/<name>/` (every repo) or
+`<repo>/.claude/skills/<name>/` (one repo). Copy `SKILL.md`, `council.config.json` and
+`scripts/` into a `council` folder in either place.
+
+macOS / Linux:
+
+```sh
+git clone https://github.com/pcbender/council
+mkdir -p ~/.claude/skills/council
+cp -R council/SKILL.md council/council.config.json council/scripts ~/.claude/skills/council/
+python3 ~/.claude/skills/council/scripts/council.py check
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/pcbender/council
+$dst = "$env:USERPROFILE\.claude\skills\council"
+New-Item -ItemType Directory -Force $dst | Out-Null
+Copy-Item -Recurse council\SKILL.md, council\council.config.json, council\scripts $dst
+pip install pywinpty
+python "$dst\scripts\council.py" check
+```
+
+`check` lists each member as ready, or says what is missing (not installed, not logged in,
+API-key auth). Then add `.council/` to the `.gitignore` of each repo you use it in.
+
+Run the tests from a clone of this repo with `python -m unittest discover -s tests`.
+
+## Configuration
+
+`council.config.json` sits next to `SKILL.md`:
+
+- `timeout_seconds`: per-member time limit.
+- `members.<name>.enabled`, `executable`, `model` (`null` = the CLI's default),
+  `extra_args`, and `role` (the focus each member is asked to take).
+- `claude` is off by default. Turn it on if you chair from another agent instead
+  (read-only; it has no write mode).
+
+## How write mode is confined
+
+Tested on Windows with Codex 0.167.2 and agy 1.5.18; the same flags apply on macOS and
+Linux.
+
 
 - **Codex** runs `codex exec --sandbox workspace-write --cd <worktree>`. It can edit files and
   run commands inside the worktree. Writes to the parent folder and the main checkout are
   denied, and so are `git add`/`commit` (a linked worktree's git metadata lives in the main
   repo's `.git/`, outside the sandbox). Network is off. Caveat found in testing: the sandbox
-  also allows writes to `%TEMP%`, so `task` refuses a worktree under `%TEMP%`.
+  also allows writes to the system temp folder, so `task` refuses a worktree under
+  `TEMP`, `TMP` or `TMPDIR`.
 - **Gemini** runs `agy --print <prompt> --add-dir <worktree> --mode accept-edits --sandbox`.
   Headless, it may edit files inside the worktree; edits elsewhere and **every** shell
   command are auto-denied, and a denial ends the run (reported as `DENIED`). So Gemini edits
@@ -56,20 +113,10 @@ the repo's `.gitignore` (task mode refuses to run without it).
   ignored files outside the allowed paths (test runs create `__pycache__` and the like).
   `cleanup` treats ignored files in a council worktree as disposable build output.
 
-## Install (Serenity, native Windows)
-
-1. Copy `SKILL.md`, `council.config.json` and `scripts\` from this repo to
-   `C:\Users\mrose\.claude\skills\council\`.
-2. `pip install pywinpty` (fallback for agy's empty-output-on-pipe bug).
-3. Log in once, interactively: `codex login`, then run `agy` once.
-4. Check: `python C:\Users\mrose\.claude\skills\council\scripts\council.py check`
-5. Tests: `python -m unittest discover -s tests`
-
 ## Shared project context (AGENTS.md)
 
 Keep rules every agent should follow in one `AGENTS.md` at the repo root. Each CLI loads
-it differently (checked against each tool's docs and with real runs on Serenity,
-2026-11-27):
+it differently (checked against each tool's docs and with real runs, November 2026):
 
 | Agent | How it gets `AGENTS.md` |
 |---|---|
@@ -91,20 +138,22 @@ Notes:
 - `AGENTS.md` and `CLAUDE.md` are on the protected list for write mode (see above), so
   members can't change the shared rules.
 
-## Delegation-of-authority hook
+## Delegation-of-authority hook (optional)
 
 `scripts/policy_gate.py` enforces the policy in `SKILL.md`. Tier 0 and Tier 1 actions pass
-silently. Tier 2 actions return `ask`, so Claude Code prompts you (on your phone over Remote
-Control) and only you can approve. "Never" actions are denied. It also contains the commit
-gate that used to be `commit_gate.py`.
+silently. Tier 2 actions return `ask`, so Claude Code prompts you (on your phone, if you
+are using Remote Control) and only you can approve. "Never" actions are denied. It also
+contains the commit gate.
 
-Add to `C:\Users\mrose\.claude\settings.json`:
+Add it to `~/.claude/settings.json` (or a repo's `.claude/settings.json`). Use the absolute
+path to where you installed the skill; on Windows, use forward slashes and `python`
+instead of `python3`.
 
 ```json
 {
   "permissions": {
     "allow": [
-      "Bash(python C:/Users/mrose/.claude/skills/council/scripts/council.py:*)"
+      "Bash(python3 /home/you/.claude/skills/council/scripts/council.py:*)"
     ]
   },
   "hooks": {
@@ -113,13 +162,17 @@ Add to `C:\Users\mrose\.claude\settings.json`:
         "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read",
         "hooks": [
           { "type": "command",
-            "command": "python C:/Users/mrose/.claude/skills/council/scripts/policy_gate.py" }
+            "command": "python3 /home/you/.claude/skills/council/scripts/policy_gate.py" }
         ]
       }
     ]
   }
 }
 ```
+
+The allow rule is a prefix match on the command Claude runs, so it only saves prompts if
+the interpreter and path match what Claude actually types. Replace `/home/you/...` with
+your real path (for example `/Users/you/...` on macOS or `C:/Users/you/...` on Windows).
 
 What it checks, in short:
 
@@ -162,5 +215,7 @@ blocks it again. Run folders alone don't turn it on.
 - Reviews of an older diff are marked stale → **REVISE**
 - Otherwise → **PASS**
 
-Change member roles, models and timeout in `council.config.json`. Turn on `claude` as a
-member if you ever chair from Codex instead (read-only; it has no write mode).
+## Background
+
+The design started as a salvage of an earlier multi-agent framework (Cantor). See
+[docs/history.md](docs/history.md) for what was kept, what changed, and why.
