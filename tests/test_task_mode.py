@@ -93,6 +93,8 @@ class TaskModeTest(unittest.TestCase):
                                          extra_args=[])
         # Stubs don't accept codex/agy flags, so build the argv ourselves.
         orig = council.ADAPTERS[member].build
+        orig_auth = council.ADAPTERS[member].check_auth
+        council.ADAPTERS[member].check_auth = lambda self_: "stub authenticated"
         council.ADAPTERS[member].build = lambda self_, pf, ws, of, write=False: (
             [self_.executable()], pf.read_text(encoding="utf-8"))
         try:
@@ -101,6 +103,7 @@ class TaskModeTest(unittest.TestCase):
             code = council.cmd_task(args, config)
         finally:
             council.ADAPTERS[member].build = orig
+            council.ADAPTERS[member].check_auth = orig_auth
         record = json.loads((self.run_dir / f"{member}.task.json").read_text())
         return code, record
 
@@ -196,14 +199,17 @@ class TaskModeTest(unittest.TestCase):
         config = council.load_config()
         config["members"]["codex"].update(enabled=True, executable=self.stub("good"), extra_args=[])
         orig = council.ADAPTERS["codex"].build
+        orig_auth = council.ADAPTERS["codex"].check_auth
         council.ADAPTERS["codex"].build = lambda self_, pf, ws, of, write=False: (
             [self_.executable()], pf.read_text(encoding="utf-8"))
+        council.ADAPTERS["codex"].check_auth = lambda self_: "stub authenticated"
         try:
             args = argparse.Namespace(member="codex", brief=str(self.run_dir / "task.md"), base=None,
                                       workspace=None, timeout=60, resume=True)
             self.assertEqual(council.cmd_task(args, config), 0)
         finally:
             council.ADAPTERS["codex"].build = orig
+            council.ADAPTERS["codex"].check_auth = orig_auth
 
     def test_gate_requires_all_reviewers(self):
         verdict = {"member": "gemini", "verdict": "pass", "findings": [],

@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import policy_gate  # noqa: E402
+import council  # noqa: E402
 
 
 def sh(cwd, *args):
@@ -226,10 +227,7 @@ class PolicyGateTest(unittest.TestCase):
         self.assertEqual(self.bash("git commit -m x"), "deny")  # no approval yet
         self.assertEqual(self.bash("git commit -am x"), "deny")
         self.assertEqual(self.bash("COUNCIL_SKIP=1 git commit -m x"), "ask")
-        staged = subprocess.run(["git", "diff", "--cached", "--binary"], cwd=self.repo,
-                                capture_output=True, text=True, encoding="utf-8").stdout
-        import hashlib
-        fp = hashlib.sha256(staged.encode("utf-8")).hexdigest()
+        fp = council.staged_fingerprint(self.repo)
         (self.repo / ".council" / "approved.json").write_text(json.dumps({"staged_fingerprint": fp}))
         self.assertEqual(self.bash("git commit -m x"), "allow")
         (self.repo / "c.txt").write_text("c\n")

@@ -354,6 +354,19 @@ def run_member(name: str, prompt_file: Path, workspace: Path, out_dir: Path, cfg
     out_file = out_dir / f"{name}.raw.md"
     result = RunResult(member=name, ok=False)
     start = time.time()
+    try:
+        adapter.executable()  # a missing binary is FAILED, not AUTH
+    except MemberUnavailable as exc:
+        result.notes.append(str(exc))
+        result.seconds = round(time.time() - start, 1)
+        return result
+    try:
+        adapter.check_auth()
+    except MemberUnavailable as exc:
+        result.auth_problem = True
+        result.notes.append(str(exc))
+        result.seconds = round(time.time() - start, 1)
+        return result
     gitfile = workspace / ".git"
     pointer = gitfile.read_bytes() if write and gitfile.is_file() else b""
 
@@ -506,36 +519,67 @@ def parse_verdict(member: str, text: str) -> dict:
 
 
 def combine(verdicts: list[dict]) -> str:
-    """Gate policy: any reject -> reject; any revise/unparseable -> revise; all pass -> pass.
-    A member that failed to run doesn't count as a pass."""
-    kinds = [v["verdict"] for v in verdicts]
-    if not kinds:
-        return "revise"
+    """Any reject -> reject; only a nonempty list of exact passes -> pass."""
+    kinds = [v.get("verdict") for v in verdicts]
     if "reject" in kinds:
         return "reject"
-    if any(k in ("revise", "unparseable", "unavailable") for k in kinds):
-        return "revise"
-    return "pass"
+    return "pass" if kinds and all(k == "pass" for k in kinds) else "revise"
 
 
 # ---------------------------------------------------------------------------
 # Diff stamp (from Cantor's workspace_patch_sha256 check): a pass only counts
 # for the exact change that was reviewed.
 # ---------------------------------------------------------------------------
-def diff_fingerprint(repo: Path) -> str:
-    def git(*args):
-        done = subprocess.run(["git", "-C", str(repo), *args], text=True, encoding="utf-8",
-                              errors="replace", capture_output=True, check=False)
-        return done.stdout if done.returncode == 0 else ""
-    staged = git("diff", "--cached", "--binary")
-    unstaged = git("diff", "--binary")
-    return hashlib.sha256((staged + "\0" + unstaged).encode("utf-8")).hexdigest()
+# Keep these staged fingerprint helpers identical to policy_gate.py. Diff output
+# must retain its whitespace, and a failed git read must never become an empty diff.
+def _fingerprint_git(repo: Path, *args) -> str:
+    argv = ["git", "-C", str(repo), *args]
+    done = subprocess.run(argv, text=True, encoding="utf-8", errors="replace",
+                          capture_output=True, check=False, timeout=20)
+    if done.returncode:
+        raise subprocess.CalledProcessError(done.returncode, argv, done.stdout, done.stderr)
+    return done.stdout
+
+
+def _fingerprint_head(repo: Path) -> str:
+    try:
+        return _fingerprint_git(repo, "rev-parse", "--verify", "HEAD").strip()
+    except subprocess.CalledProcessError as exc:
+        # Only a symbolic HEAD whose ref does not exist is unborn. Repository,
+        # object and other git errors must propagate rather than use the marker.
+        ref = _fingerprint_git(repo, "symbolic-ref", "--quiet", "HEAD").strip()
+        if not ref.startswith("refs/heads/"):
+            raise exc
+        try:
+            _fingerprint_git(repo, "show-ref", "--verify", "--quiet", ref)
+        except subprocess.CalledProcessError as missing:
+            if missing.returncode == 1:
+                return "unborn HEAD"
+            raise
+        raise exc
+
+
+def _staged_fingerprint(head: str, staged: str) -> str:
+    return hashlib.sha256((head + "\0" + staged).encode("utf-8")).hexdigest()
 
 
 def staged_fingerprint(repo: Path) -> str:
-    done = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--binary"], text=True,
-                          encoding="utf-8", errors="replace", capture_output=True, check=False)
-    return hashlib.sha256(done.stdout.encode("utf-8")).hexdigest()
+    head = _fingerprint_head(repo)
+    staged = _fingerprint_git(repo, "diff", "--cached", "--binary")
+    return _staged_fingerprint(head, staged)
+
+
+def _diff_fingerprints(repo: Path) -> tuple[str, str]:
+    """Working and staged fingerprints derived from one set of git reads."""
+    head = _fingerprint_head(repo)
+    staged = _fingerprint_git(repo, "diff", "--cached", "--binary")
+    unstaged = _fingerprint_git(repo, "diff", "--binary")
+    working = hashlib.sha256((head + "\0" + staged + "\0" + unstaged).encode("utf-8")).hexdigest()
+    return working, _staged_fingerprint(head, staged)
+
+
+def diff_fingerprint(repo: Path) -> str:
+    return _diff_fingerprints(repo)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -626,39 +670,66 @@ def cmd_run(args, config, kind: str):
 def cmd_gate(args, config):
     out_dir = Path(args.dir).resolve()
     repo = repo_root(Path(args.workspace).resolve() if args.workspace else Path.cwd())
-    verdicts = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(out_dir.glob("*.verdict.json"))]
     # Required reviewers: --require, else every enabled member. A missing one can't pass.
     required = ([m.strip() for m in args.require.split(",") if m.strip()] if args.require else
                 [n for n, c in config["members"].items() if c.get("enabled")])
+    verdicts = []
+    for path in sorted(out_dir.glob("*.verdict.json")):
+        try:
+            # int rejects the decoder's non-JSON constants (NaN and +/-Infinity).
+            data = json.loads(path.read_text(encoding="utf-8"), parse_constant=int)
+        except (OSError, ValueError, RecursionError):
+            data = None
+        member = data.get("member") if isinstance(data, dict) else None
+        known_member = isinstance(member, str) and member in config["members"]
+        if not known_member:
+            member = path.name.removesuffix(".verdict.json")
+            if member not in config["members"]:
+                continue  # no identifiable member; its required review stays missing
+        if (not known_member or data.get("verdict") not in (*VERDICTS, "unparseable", "unavailable")
+                or not isinstance(data.get("fingerprint"), str)
+                or not isinstance(data.get("findings", []), list)
+                or any(not isinstance(f, dict) for f in data.get("findings", []))):
+            data = {"member": member, "verdict": "unparseable", "findings": []}
+        verdicts.append(data)
     if args.require:
         verdicts = [v for v in verdicts if v["member"] in required]
-    have = {v["member"] for v in verdicts}
-    missing = [m for m in required if m not in have]
-    current = diff_fingerprint(repo)
-    stale = [v["member"] for v in verdicts if v.get("fingerprint") != current]
+    by_member = {}
+    for verdict in verdicts:
+        by_member.setdefault(verdict["member"], []).append(verdict)
+    missing = [m for m in required if m not in by_member]
+    stamp = repo / ".council" / "approved.json"
+    try:
+        current, staged = _diff_fingerprints(repo)
+    except BaseException:
+        # Can't tell what is staged: withdraw any earlier approval before failing.
+        if stamp.is_file():
+            stamp.unlink()
+        raise
+    stale =[v["member"] for v in verdicts if v.get("fingerprint") != current]
     decision = combine(verdicts)
     if stale or missing:
         decision = "revise" if decision != "reject" else decision
     gate = {
         "decision": decision,
-        "members": {v["member"]: v["verdict"] for v in verdicts},
+        "members": {m: vs[0]["verdict"] if len(vs) == 1 else combine(vs)
+                    for m, vs in by_member.items()},
         "required": required,
         "missing_reviews": missing,
         "stale_reviews": stale,
-        "staged_fingerprint": staged_fingerprint(repo),
+        "staged_fingerprint": staged,
         "working_fingerprint": current,
         "findings": [dict(f, member=v["member"]) for v in verdicts for f in v.get("findings", [])],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     (out_dir / "gate.json").write_text(json.dumps(gate, indent=2), encoding="utf-8")
-    stamp = repo / ".council" / "approved.json"
     if decision == "pass":
         stamp.parent.mkdir(exist_ok=True)
         stamp.write_text(json.dumps({"staged_fingerprint": gate["staged_fingerprint"],
                                      "source": str(out_dir / "gate.json")}, indent=2), encoding="utf-8")
     elif stamp.is_file():
         stamp.unlink()  # a later non-pass withdraws any earlier approval
-    counts = {s: sum(1 for f in gate["findings"] if f["severity"] == s) for s in SEVERITIES}
+    counts = {s: sum(1 for f in gate["findings"] if f.get("severity") == s) for s in SEVERITIES}
     print(f"GATE: {decision.upper()} | " + ", ".join(f"{m}={v}" for m, v in gate["members"].items())
           + f" | findings: {counts}" + (f" | stale: {stale}" if stale else "")
           + (f" | missing: {missing}" if missing else ""))
