@@ -273,6 +273,11 @@ class GeminiAgyAdapter(Adapter):
             # its workspace (e.g. reviewing a worktree with the brief in the main repo).
             argv = [self.executable(), "--print", instruction, "--add-dir", str(workspace),
                     "--add-dir", str(prompt_file.parent), "--mode", "plan"]
+            # Reviewing a linked worktree, agy tends to open the main checkout's copy of a
+            # file to compare; that read is denied and ends the run. Plan mode is read-only.
+            main = main_checkout(workspace)
+            if main is not None:
+                argv[-2:-2] = ["--add-dir", str(main)]
         if self.cfg.get("model"):
             argv += ["--model", self.cfg["model"]]
         argv += list(self.cfg.get("extra_args", []))
@@ -758,6 +763,19 @@ def repo_root(start: Path) -> Path:
     if not top:
         raise RuntimeError(f"Not inside a git repository: {start}")
     return Path(top).resolve()
+
+
+def main_checkout(workspace: Path) -> Path | None:
+    """The main checkout when `workspace` is a linked worktree, else None."""
+    ok, top = git_ok(workspace, "rev-parse", "--show-toplevel")
+    ok2, common = git_ok(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not (ok and ok2):
+        return None
+    common_dir = Path(common.strip()).resolve()
+    if common_dir.name != ".git":
+        return None  # bare or unusual layout: don't guess
+    main = common_dir.parent
+    return None if main == Path(top.strip()).resolve() else main
 
 
 def run_slug(run_dir: Path) -> str:
