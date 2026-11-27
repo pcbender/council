@@ -389,10 +389,56 @@ def check_git(cwd: Path, sub: str, args: list[str], risky: list[str], command: s
     return None
 
 
+# Keep these staged fingerprint helpers identical to council.py. Unlike git(),
+# they preserve diff whitespace and propagate failures instead of returning "".
+def _fingerprint_git(repo: Path, *args) -> str:
+    argv = ["git", "-C", str(repo), *args]
+    done = subprocess.run(argv, text=True, encoding="utf-8", errors="replace",
+                          capture_output=True, check=False, timeout=20)
+    if done.returncode:
+        raise subprocess.CalledProcessError(done.returncode, argv, done.stdout, done.stderr)
+    return done.stdout
+
+
+def _fingerprint_head(repo: Path) -> str:
+    try:
+        return _fingerprint_git(repo, "rev-parse", "--verify", "HEAD").strip()
+    except subprocess.CalledProcessError as exc:
+        # Only a symbolic HEAD whose ref does not exist is unborn. Repository,
+        # object and other git errors must propagate rather than use the marker.
+        ref = _fingerprint_git(repo, "symbolic-ref", "--quiet", "HEAD").strip()
+        if not ref.startswith("refs/heads/"):
+            raise exc
+        try:
+            _fingerprint_git(repo, "show-ref", "--verify", "--quiet", ref)
+        except subprocess.CalledProcessError as missing:
+            if missing.returncode == 1:
+                return "unborn HEAD"
+            raise
+        raise exc
+
+
+def _staged_fingerprint(head: str, staged: str) -> str:
+    return hashlib.sha256((head + "\0" + staged).encode("utf-8")).hexdigest()
+
+
+def staged_fingerprint(repo: Path) -> str:
+    head = _fingerprint_head(repo)
+    staged = _fingerprint_git(repo, "diff", "--cached", "--binary")
+    return _staged_fingerprint(head, staged)
+
+
 def commit_gate(cwd: Path, args, flags, pos, command: str):
-    top = repo_top(cwd)
+    try:
+        # The permissive repo helpers fall back to cwd on errors. Here that could
+        # hide an enforcement marker in a parent checkout or the main worktree.
+        top = Path(_fingerprint_git(cwd, "rev-parse", "--show-toplevel").strip())
+        common = Path(_fingerprint_git(cwd, "rev-parse", "--path-format=absolute",
+                                       "--git-common-dir").strip())
+    except (OSError, subprocess.SubprocessError):
+        return "deny", "Council gate: cannot locate repository state. Re-run /council review."
     markers = (top / ".council" / "enforce-commit-gate",
-               main_repo(cwd) / ".council" / "enforce-commit-gate")
+               common.parent / ".council" / "enforce-commit-gate")
     if not any(m.is_file() for m in markers):
         return None  # gate not enabled for this repo (run folders alone don't enable it)
     unsafe = {"-a", "--all", "-i", "--include", "-o", "--only", "--amend", "-p", "--patch",
@@ -403,17 +449,17 @@ def commit_gate(cwd: Path, args, flags, pos, command: str):
     if command == "COUNCIL_SKIP=1":  # set by check_segment from an env prefix, not message text
         return "ask", "COUNCIL_SKIP=1 bypasses the council commit gate; the user decides (Tier 2)."
     stamp = top / ".council" / "approved.json"
-    staged = subprocess.run(["git", "-C", str(top), "diff", "--cached", "--binary"], text=True,
-                            encoding="utf-8", errors="replace", capture_output=True,
-                            check=False).stdout
-    fingerprint = hashlib.sha256(staged.encode("utf-8")).hexdigest()
+    try:
+        fingerprint = staged_fingerprint(top)
+    except (OSError, subprocess.SubprocessError):
+        return "deny", "Council gate: cannot read repository state. Re-run /council review."
     if not stamp.is_file():
         return "deny", "Council gate: no passing council review here. Run /council review first."
     try:
-        approved = json.loads(stamp.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        approved = json.loads(stamp.read_text(encoding="utf-8"), parse_constant=int)
+    except (OSError, ValueError, RecursionError):
         approved = {}
-    if approved.get("staged_fingerprint") != fingerprint:
+    if not isinstance(approved, dict) or approved.get("staged_fingerprint") != fingerprint:
         return "deny", ("Council gate: the staged change differs from what the council approved. "
                         "Re-run /council review.")
     return None
