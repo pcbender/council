@@ -1,4 +1,4 @@
-"""Tests for the delegation-of-authority hook. Run: python -m unittest discover council/tests"""
+"""Tests for the delegation-of-authority hook. Run: python -m unittest discover -s tests"""
 from __future__ import annotations
 
 import json

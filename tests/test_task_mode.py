@@ -1,5 +1,5 @@
 """Write-mode tests with stub members (no real CLI is called).
-Run: python -m unittest discover council/tests"""
+Run: python -m unittest discover -s tests"""
 from __future__ import annotations
 
 import argparse

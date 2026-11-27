@@ -58,11 +58,12 @@ the repo's `.gitignore` (task mode refuses to run without it).
 
 ## Install (Serenity, native Windows)
 
-1. Copy this folder to `C:\Users\mrose\.claude\skills\council\`.
+1. Copy `SKILL.md`, `council.config.json` and `scripts\` from this repo to
+   `C:\Users\mrose\.claude\skills\council\`.
 2. `pip install pywinpty` (fallback for agy's empty-output-on-pipe bug).
 3. Log in once, interactively: `codex login`, then run `agy` once.
 4. Check: `python C:\Users\mrose\.claude\skills\council\scripts\council.py check`
-5. Tests: `python -m unittest discover -s council/tests`
+5. Tests: `python -m unittest discover -s tests`
 
 ## Shared project context (AGENTS.md)
 

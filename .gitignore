@@ -1,0 +1,3 @@
+# Council runs, worktrees and gate stamps (local only)
+.council/
+__pycache__/
