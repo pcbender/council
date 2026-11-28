@@ -118,9 +118,9 @@ DEFAULT_CONFIG = {
             "max_steps": 25,
             "test_timeout_seconds": 120,
             "tiers": {
-                "fast": {"model": "qwen2.5-coder:14b"},
+                "fast": {"model": "qwen3.5:9b"},
                 "standard": {"model": "qwen2.5-coder:14b"},
-                "deep": {"model": "qwen3-coder:30b-a3b"},
+                "deep": {"model": "qwen3-coder:30b"},
             },
             "role": "Local implementation worker: execute bounded file edits and iterate against tests.",
         }

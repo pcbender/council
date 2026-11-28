@@ -28,10 +28,11 @@ Run artifacts live in `.council/runs/` and isolated task worktrees in `.council/
   - **Codex**: Codex CLI (`codex`), logged in with ChatGPT (`codex login`; API keys are refused).
 - **Ollama** (optional, enabled by default as the local `ollama` worker delegate):
   - Running locally at `http://127.0.0.1:11434` with at least one pulled coding model.
-  - **Recommended for 16 GB VRAM + high system RAM (e.g. RTX 5080 + 64–96 GB DDR5)**:
-    - `fast` / `standard` (100% VRAM-resident, kept warm to avoid swap latency): `ollama pull qwen2.5-coder:14b` (or `qwen3:14b`, `devstral:24b`).
-    - `deep` (MoE coding model leveraging fast DDR5 spillover): `ollama pull qwen3-coder:30b-a3b`.
-    - If a configured tag isn't pulled yet, `council.py` automatically falls back to whatever coding model is installed in `ollama list` (e.g., `qwen3.5:9b`).
+  - **Recommended 3-tier lineup for 16 GB VRAM + high system RAM (e.g. RTX 5080 + 64–96 GB DDR5)**:
+    - `fast` (100% VRAM, quickest turnaround): `ollama pull qwen3.5:9b` (~6.6 GB).
+    - `standard` (100% VRAM coding workhorse): `ollama pull qwen2.5-coder:14b` (~9.0 GB).
+    - `deep` (30B-A3B MoE coder leveraging fast DDR5 spillover): `ollama pull qwen3-coder:30b` (~18 GB).
+    - If a configured tag isn't pulled yet, `council.py` automatically falls back to whatever coding model is installed in `ollama list`.
 
 ## Install Across All Three CLIs
 
