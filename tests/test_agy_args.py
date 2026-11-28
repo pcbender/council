@@ -57,6 +57,52 @@ class AgyReadDirsTest(unittest.TestCase):
         dirs = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
         self.assertEqual(dirs, [str(self.wt)])
 
+    def test_tier_model_and_effort_flags_across_adapters(self):
+        out = self.prompt.parent / "out.md"
+        # Gemini (agy)
+        argv, _ = self.adapter.build(self.prompt, self.repo, out, model="gemini-pro", effort="high")
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-pro")
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+        # Codex
+        codex = council.CodexAdapter({"executable": sys.executable})
+        c_argv, stdin_text = codex.build(self.prompt, self.repo, out, write=True, model="o3", effort="high")
+        self.assertEqual(stdin_text, "brief")
+        self.assertEqual(c_argv[c_argv.index("--sandbox") + 1], "workspace-write")
+        self.assertEqual(c_argv[c_argv.index("--model") + 1], "o3")
+        self.assertIn('model_reasoning_effort="high"', c_argv)
+
+        # Claude read & confined write mode
+        claude = council.ClaudeAdapter({"executable": sys.executable})
+        cl_read, _ = claude.build(self.prompt, self.wt, out, write=False, model="sonnet", effort="medium")
+        self.assertEqual(cl_read[cl_read.index("--permission-mode") + 1], "plan")
+        read_dirs = [Path(cl_read[i + 1]).resolve() for i, a in enumerate(cl_read) if a == "--add-dir"]
+        self.assertIn(self.repo, read_dirs)
+
+        cl_write, _ = claude.build(self.prompt, self.wt, out, write=True, model="opus", effort="high")
+        self.assertIn("--restricted", cl_write)
+        self.assertEqual(cl_write[cl_write.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(cl_write[cl_write.index("--permission-prompts") + 1], "none")
+        write_dirs = [cl_write[i + 1] for i, a in enumerate(cl_write) if a == "--add-dir"]
+        self.assertEqual(write_dirs, [str(self.wt)])
+        self.assertEqual(cl_write[cl_write.index("--model") + 1], "opus")
+        self.assertEqual(cl_write[cl_write.index("--effort") + 1], "high")
+
+    def test_resolve_tier_precedence(self):
+        cfg = {
+            "model": "base-model",
+            "tiers": {
+                "fast": {"model": "fast-model", "effort": "low"},
+                "deep": {"model": None, "effort": "high"},
+            },
+        }
+        self.assertEqual(council.resolve_tier(cfg), ("base-model", None))
+        self.assertEqual(council.resolve_tier(cfg, tier="fast"), ("fast-model", "low"))
+        self.assertEqual(council.resolve_tier(cfg, tier="deep"), ("base-model", "high"))
+        self.assertEqual(council.resolve_tier(cfg, tier="fast", model="custom", effort="max"),
+                         ("custom", "max"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -248,6 +248,69 @@ class PolicyGateTest(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), "")
         self.assertEqual(done.returncode, 0)
 
+    def test_agy_hook_protocol_and_multi_chairman_branches(self):
+        # Delegated feature branches for all chairman CLIs are allowed
+        for branch in ("codex/feat", "agy/feat", "gemini/feat"):
+            with self.subTest(branch=branch):
+                self.assertEqual(self.bash(f"git push origin {branch}"), "allow")
+
+        # Antigravity (agy) PreToolUse payloads via subprocess
+        def run_agy(tool_name, **args):
+            payload = {"cwd": str(self.repo), "toolCall": {"id": "1", "name": tool_name, "args": args}}
+            done = subprocess.run([sys.executable, str(Path(policy_gate.__file__))],
+                                  input=json.dumps(payload), capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0)
+            return json.loads(done.stdout)
+
+        self.assertEqual(run_agy("run_command", CommandLine="git status"), {"decision": "allow"})
+        ask_out = run_agy("run_command", CommandLine="git push origin main")
+        self.assertEqual(ask_out["decision"], "force_ask")
+        deny_out = run_agy("read_file", Path="~/.codex/auth.json")
+        self.assertEqual(deny_out["decision"], "deny")
+        cfg_out = run_agy("edit_file", Path=str(self.repo / ".agents" / "hooks.json"))
+        self.assertEqual(cfg_out["decision"], "force_ask")
+        verdict_out = run_agy("write_file", Path=str(self.repo / ".council" / "runs" / "r1" / "codex.verdict.json"))
+        self.assertEqual(verdict_out["decision"], "deny")
+
+        # Additional regression tests for policy gate decisions
+        cases = [
+            ("write_to_file", {"TargetFile": str(self.repo / "src" / "ok.py")}, "allow"),
+            ("view_file", {"AbsolutePath": str(self.repo / "a.txt")}, "allow"),
+            ("write_to_file", {"TargetFile": str(self.repo / ".council" / "approved.json")}, "deny"),
+            ("replace_file_content", {"TargetFile": str(self.repo / ".claude" / "settings.json")}, "force_ask"),
+            ("multi_replace_file_content", {"file_path": str(self.repo / ".gitignore")}, "force_ask"),
+            ("view_file", {"AbsolutePath": "~/.codex/auth.json"}, "deny"),
+            ("write_file", {}, "force_ask"),
+            ("view_file", {}, "force_ask"),
+            ("run_command", {}, "force_ask"),
+            # Key-shadowing attempt: benign Path + protected TargetFile must take strictest (deny)
+            ("write_to_file", {"Path": str(self.repo / "src" / "ok.py"),
+                               "TargetFile": str(self.repo / ".council" / "approved.json")}, "deny"),
+            ("view_file", {"Path": str(self.repo / "a.txt"),
+                           "AbsolutePath": "~/.codex/auth.json"}, "deny"),
+        ]
+        for tool_name, kwargs, expected in cases:
+            with self.subTest(tool=tool_name, kwargs=kwargs):
+                self.assertEqual(run_agy(tool_name, **kwargs)["decision"], expected)
+
+        # Malformed non-object args fail closed
+        bad_payload = {"cwd": str(self.repo), "toolCall": {"id": "1", "name": "run_command", "args": "bad"}}
+        bad_done = subprocess.run([sys.executable, str(Path(policy_gate.__file__))],
+                                  input=json.dumps(bad_payload), capture_output=True, text=True)
+        self.assertEqual(json.loads(bad_done.stdout)["decision"], "force_ask")
+
+        # Temporary repo on main branch (inside self.tmp, with local git identity set)
+        main_repo = Path(self.tmp.name) / "main_only"
+        main_repo.mkdir()
+        sh(main_repo, "git", "init", "-q", "-b", "main")
+        sh(main_repo, "git", "config", "user.email", "t@t")
+        sh(main_repo, "git", "config", "user.name", "t")
+        (main_repo / "initial.txt").write_text("initial\n")
+        sh(main_repo, "git", "add", ".")
+        sh(main_repo, "git", "commit", "-qm", "init")
+        self.assertEqual(run_agy("run_command", CommandLine="git commit -m x", Cwd=str(main_repo))["decision"], "force_ask")
+        self.assertEqual(run_agy("run_command", CommandLine="git commit -m x", cwd="../main_only")["decision"], "force_ask")
+
 
 if __name__ == "__main__":
     unittest.main()
