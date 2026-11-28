@@ -30,15 +30,15 @@ from pathlib import Path
 
 MERGE_ASK_LINES = 400
 PROTECTED_BRANCHES = {"main", "master"}
-OWN_BRANCH_PREFIXES = ("council/", "claude/")
+OWN_BRANCH_PREFIXES = ("council/", "claude/", "codex/", "agy/", "gemini/")
 
 NEVER_FLAGS = ("danger-full-access", "--dangerously-bypass-approvals-and-sandbox",
-               "--dangerously-skip-permissions", "--yolo")
-AGENT_CLIS = {"codex", "agy", "claude", "gemini"}
-CONFIG_NAMES = {"settings.json", "settings.local.json", "council.config.json", "claude.md",
-                "agents.md", "gemini.md", ".gitignore", "package-lock.json", "yarn.lock",
-                "pnpm-lock.yaml", "uv.lock", "poetry.lock", "cargo.lock"}
-CONFIG_DIRS = {".claude", ".github", ".canto"}
+               "--dangerously-skip-permissions", "--yolo", "bypasspermissions")
+AGENT_CLIS = {"codex", "agy", "claude", "gemini", "ollama"}
+CONFIG_NAMES = {"settings.json", "settings.local.json", "hooks.json", "council.config.json",
+                "claude.md", "agents.md", "gemini.md", ".gitignore", "package-lock.json",
+                "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "cargo.lock"}
+CONFIG_DIRS = {".claude", ".github", ".canto", ".agents", ".agent", ".codex", ".gemini"}
 SHELLS = {"bash", "sh", "zsh", "pwsh", "powershell", "cmd"}
 PREFIX_WORDS = {"env", "command", "sudo", "exec", "time", "nohup", "&", ".", "call", "builtin"}
 WRITE_VERBS = {"set-content", "sc", "out-file", "add-content", "ac", "tee", "tee-object", "cp",
@@ -295,7 +295,7 @@ def check_push(cwd: Path, args: list[str]):
         if dst in PROTECTED_BRANCHES:
             return "ask", f"Pushing to {dst} needs the user's approval (Tier 2)."
         if not own_branch(dst):
-            return "ask", (f"Pushing to {dst}, which is not a council/ or claude/ branch, "
+            return "ask", (f"Pushing to {dst}, which is not a delegated council/chairman branch, "
                            "needs the user's approval (Tier 2).")
     return None
 
@@ -623,11 +623,36 @@ def check_file_tool(raw: str, cwd: Path):
     return None
 
 
+def agy_decision(hit: tuple[str, str] | None) -> dict:
+    if hit is None:
+        return {"decision": "allow"}
+    kind, reason = hit
+    # Use force_ask for Tier 2 so cached "Always Allow" grants don't skip approval.
+    return {"decision": "force_ask" if kind == "ask" else "deny", "reason": reason}
+
+
 def evaluate(payload: dict):
     _BRANCH_OVERRIDE.clear()
+    cwd = Path(payload.get("cwd") or ".")
+
+    # Antigravity (agy) PreToolUse format: {"toolCall": {"name": ..., "args": {...}}, "cwd": ...}
+    tool_call = payload.get("toolCall")
+    if isinstance(tool_call, dict):
+        t_name = str(tool_call.get("name") or "")
+        args = tool_call.get("args") or {}
+        if t_name == "run_command":
+            return check_shell(args.get("CommandLine") or args.get("command") or "", cwd)
+        if t_name in ("edit_file", "write_file", "multi_edit"):
+            return check_file_tool(args.get("Path") or args.get("file_path") or "", cwd)
+        if t_name in ("read_file", "view_file"):
+            raw = args.get("Path") or args.get("file_path") or ""
+            if raw and is_secret(norm_path(raw, cwd)):
+                return "deny", "Reading CLI credentials is never delegated."
+        return None
+
+    # Claude Code PreToolUse format: {"tool_name": ..., "tool_input": {...}, "cwd": ...}
     tool = payload.get("tool_name", "")
     tool_input = payload.get("tool_input") or {}
-    cwd = Path(payload.get("cwd") or ".")
     if tool in ("Bash", "PowerShell"):
         return check_shell(tool_input.get("command", ""), cwd)
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
@@ -642,7 +667,12 @@ def main() -> int:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         return 0
+    if not isinstance(payload, dict):
+        return 0
     hit = evaluate(payload)
+    if isinstance(payload.get("toolCall"), dict):
+        print(json.dumps(agy_decision(hit)))
+        return 0
     if hit:
         print(json.dumps(decision(*hit)))
     return 0

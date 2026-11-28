@@ -1,221 +1,90 @@
-# Council skill for Claude Code
+# Council — Multi-Agent Subscription Council + Local Ollama Worker
 
-Council turns Claude Code into the **chairman** of a small panel of coding agents. Codex
-(ChatGPT subscription) and Gemini (Google subscription, via the Antigravity CLI `agy`) are
-**members**: Claude asks them how they would approach a problem, has them review a staged
-change, or hands them a task to do in their own git worktree. Members run on your existing
-subscription logins, never on metered API keys.
+Council turns **whichever coding CLI you open** — **Antigravity (`agy`)**, **Claude Code (`claude`)**, or **Codex (`codex`)** — into the **Chairman** of a three-vendor agent council, backed by a **local Ollama worker delegate**:
 
-Members are read-only when consulted or reviewing, and confined to their own worktree when
-given a task. A policy hook (optional) keeps the chairman inside a delegation-of-authority
-policy, which works well when you drive Claude Code from your phone over Remote Control.
+- **Voting Council (Cloud Subscriptions)**: The active CLI acts as Chairman and convenes the **other two** headless (`codex`, `claude`, `gemini` via `agy`) to deliberate on approaches (`consult` / `ask`) and verify changes (`review` / `gate`). Everything runs on your existing consumer subscriptions — never metered API keys.
+- **Worker Delegate (Local Ollama)**: Once the council converges on an approach, the Chairman routes well-scoped implementation tasks to a confined local **Ollama** worker (`ollama`) at zero quota cost, saving cloud dispatches for complex tasks and code review.
 
 ## Modes
 
-| Mode | Command | Members can |
+| Mode | Command | What happens |
 | --- | --- | --- |
-| Consult | `/council approach <problem>` | read the repo, propose a plan |
-| Ask | `/council <question>` | read the repo, answer |
-| Review | `/council review` | read the staged diff, return a verdict |
-| Task | `/council task <what to do>` | edit files in `.council/worktrees/<run>-<member>` only |
-| Check | `/council check` | nothing; reports which members are ready |
+| **Consult** | `/council approach <problem>` | Voting council proposes plans in parallel; Chairman synthesizes an adaptive task plan + worker assignments and waits for your go-ahead |
+| **Implement** | `/council implement <task>` | Runs deliberation straight into worktree task execution, cross-review, gate check, and branch merge |
+| **Ask** | `/council <question>` | Open design/architecture deliberation across the council |
+| **Task** | `/council task <what to do>` | Dispatches a worker (`ollama`, `codex`, `claude`, or `gemini`) inside an isolated `.council/worktrees/` branch |
+| **Review** | `/council review` | Voting council reviews the staged diff and runs the fail-closed `gate` |
+| **Check** | `/council check` | Reports member auth, rolling 5h/24h usage, quota cooldowns, and installed/warm Ollama models |
 
-Run folders go in `.council/runs/`, worktrees in `.council/worktrees/`. Add `.council/` to
-the repo's `.gitignore` (task mode refuses to run without it).
+Run artifacts live in `.council/runs/` and isolated task worktrees in `.council/worktrees/`. Add `.council/` to each repo's `.gitignore` (`task` mode refuses to run without it).
 
 ## Requirements
 
-- Claude Code (any surface: terminal, Desktop app, IDE).
-- Python 3.9 or newer. The scripts use only the standard library, except for
-  `pywinpty` on Windows (see below).
+- Python 3.9+ (stdlib only; `pip install pywinpty` recommended on Windows for `agy`'s non-TTY fallback).
 - Git.
-- At least one member CLI, logged in with a subscription account:
-  - **Codex**: `codex` CLI, logged in with ChatGPT (`codex login`). `council.py check`
-    refuses it if it is set up with an API key.
-  - **Gemini**: Antigravity CLI `agy`, logged in by running `agy` once interactively.
-    (The older Gemini CLI no longer serves Google AI Pro/Ultra subscriptions.)
-- Windows only: `pip install pywinpty`. `agy` sometimes prints nothing when its output is
-  piped, and the runner retries under a pseudo-terminal. macOS and Linux use the stdlib
-  `pty` module, so nothing extra is needed there.
+- Consumer subscription CLIs (enable whichever ones you use in `council.config.json`):
+  - **Gemini**: Antigravity CLI (`agy`), logged in once interactively.
+  - **Claude**: Claude Code CLI (`claude`), logged in via `claude.ai` subscription (`claude auth status`).
+  - **Codex**: Codex CLI (`codex`), logged in with ChatGPT (`codex login`; API keys are refused).
+- **Ollama** (optional, enabled by default as the local `ollama` worker delegate):
+  - Running locally at `http://127.0.0.1:11434` with at least one pulled coding model.
+  - **Recommended for 16 GB VRAM + high system RAM (e.g. RTX 5080 + 64–96 GB DDR5)**:
+    - `fast` / `standard` (100% VRAM-resident, kept warm to avoid swap latency): `ollama pull qwen2.5-coder:14b` (or `qwen3:14b`, `devstral:24b`).
+    - `deep` (MoE coding model leveraging fast DDR5 spillover): `ollama pull qwen3-coder:30b-a3b`.
+    - If a configured tag isn't pulled yet, `council.py` automatically falls back to whatever coding model is installed in `ollama list` (e.g., `qwen3.5:9b`).
 
-Disable a member you don't have in `council.config.json` (`"enabled": false`).
+## Install Across All Three CLIs
 
-## Install
-
-Claude Code loads skills from `~/.claude/skills/<name>/` (every repo) or
-`<repo>/.claude/skills/<name>/` (one repo). Copy `SKILL.md`, `council.config.json` and
-`scripts/` into a `council` folder in either place.
-
-macOS / Linux:
-
-```sh
-git clone https://github.com/pcbender/council
-mkdir -p ~/.claude/skills/council
-cp -R council/SKILL.md council/council.config.json council/scripts ~/.claude/skills/council/
-python3 ~/.claude/skills/council/scripts/council.py check
-```
-
-Windows (PowerShell):
+Link this repository once as a single source of truth into Antigravity (`~/.gemini/config/skills/council`), Claude Code (`~/.claude/skills/council`), and Codex (`~/.agents/skills/council`). On Windows, `install` uses directory junctions (`mklink /J`), which require **no Administrator privileges**:
 
 ```powershell
 git clone https://github.com/pcbender/council
-$dst = "$env:USERPROFILE\.claude\skills\council"
-New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item -Recurse council\SKILL.md, council\council.config.json, council\scripts $dst
-pip install pywinpty
-python "$dst\scripts\council.py" check
+cd council
+pip install pywinpty   # Windows only
+python scripts/council.py install
+python scripts/council.py check --chairman auto
 ```
 
-`check` lists each member as ready, or says what is missing (not installed, not logged in,
-API-key auth). Then add `.council/` to the `.gitignore` of each repo you use it in.
+Pass `--with-hooks` to `install` if you also want the optional `policy_gate.py` `PreToolUse` hook wired into `~/.claude/settings.json` and `~/.gemini/config/hooks.json` (`--force` replaces any earlier copied skill folders).
 
-Run the tests from a clone of this repo with `python -m unittest discover -s tests`.
+Run the test suite with:
 
-## Configuration
-
-`council.config.json` sits next to `SKILL.md`:
-
-- `timeout_seconds`: per-member time limit.
-- `members.<name>.enabled`, `executable`, `model` (`null` = the CLI's default),
-  `extra_args`, and `role` (the focus each member is asked to take).
-- `claude` is off by default. Turn it on if you chair from another agent instead
-  (read-only; it has no write mode).
-
-## How write mode is confined
-
-Tested on Windows with Codex 0.167.2 and agy 1.5.18; the same flags apply on macOS and
-Linux.
-
-
-- **Codex** runs `codex exec --sandbox workspace-write --cd <worktree>`. It can edit files and
-  run commands inside the worktree. Writes to the parent folder and the main checkout are
-  denied, and so are `git add`/`commit` (a linked worktree's git metadata lives in the main
-  repo's `.git/`, outside the sandbox). Network is off. Caveat found in testing: the sandbox
-  also allows writes to the system temp folder, so `task` refuses a worktree under
-  `TEMP`, `TMP` or `TMPDIR`.
-- **Gemini** runs `agy --print <prompt> --add-dir <worktree> --mode accept-edits --sandbox`.
-  Headless, it may edit files inside the worktree; edits elsewhere and **every** shell
-  command are auto-denied, and a denial ends the run (reported as `DENIED`). So Gemini edits
-  and the chairman runs the tests. Per-session allow rules via `agy --settings` did not take
-  effect in testing.
-- **Afterwards** the runner compares the main checkout (HEAD, branch, status, refs, stash)
-  before and after, checks the worktree has no new commits, and checks every changed path
-  against the brief's `## Allowed paths` and a protected list (`.git`, `.github/`, `.claude/`,
-  `.council/`, `.canto/`, `council.config.json`, `CLAUDE.md`, `.gitignore`, settings,
-  lockfiles, `.env`). The main-checkout comparison uses content hashes, renames are checked
-  as their new path, ignored files the member created are checked too, and a rewritten
-  worktree `.git` pointer is caught before any git command runs there. Any breach is
-  `VIOLATION`. Branches under `council/` are left out of the comparison so two tasks can run
-  in parallel.
-- **Another round** on the same worktree: `task ... --continue` (only for the registered
-  worktree on its `council/` branch).
-- Not checked: edits to files that were already gitignored inside the worktree, and new
-  ignored files outside the allowed paths (test runs create `__pycache__` and the like).
-  `cleanup` treats ignored files in a council worktree as disposable build output.
-
-## Shared project context (AGENTS.md)
-
-Keep rules every agent should follow in one `AGENTS.md` at the repo root. Each CLI loads
-it differently (checked against each tool's docs and with real runs, November 2026):
-
-| Agent | How it gets `AGENTS.md` |
-|---|---|
-| Codex (0.167.2) | Natively. Reads `~/.codex/AGENTS.md`, then every `AGENTS.md` from the git root down to `--cd`. 32 KiB cap (`project_doc_max_bytes`). |
-| Gemini via agy (1.5.18) | Natively. Reads `AGENTS.md` or `GEMINI.md` (and `.agents/rules/*.md`) in the workspace and each parent up to the repo root, plus `~/.gemini/AGENTS.md` and `~/.gemini/config/...` globals. Works in `--print` mode. |
-| Claude Code (2.1.325) | Reads `AGENTS.md` only when no `CLAUDE.md` exists. If the repo has a `CLAUDE.md`, that file must start with `@AGENTS.md`. |
-
-Council runs inherit this for free: `council.py` starts Codex with `--cd <workspace>` and
-agy with the workspace as its folder, and a task worktree is a full checkout, so both
-members see the repo's `AGENTS.md` without it being pasted into the brief. A consult
-probe confirmed both members quoted the repo's `AGENTS.md` headings without reading any
-file.
-
-Notes:
-- Put shared rules in `AGENTS.md`, Claude-only notes under the import in `CLAUDE.md`.
-  Don't keep a `GEMINI.md` beside it: agy loads both, so rules would be duplicated.
-- Everything in `AGENTS.md` reaches every member on every run, so keep it short and
-  current. A stale section misleads all three agents at once.
-- `AGENTS.md` and `CLAUDE.md` are on the protected list for write mode (see above), so
-  members can't change the shared rules.
-
-## Delegation-of-authority hook (optional)
-
-`scripts/policy_gate.py` enforces the policy in `SKILL.md`. Tier 0 and Tier 1 actions pass
-silently. Tier 2 actions return `ask`, so Claude Code prompts you (on your phone, if you
-are using Remote Control) and only you can approve. "Never" actions are denied. It also
-contains the commit gate.
-
-Add it to `~/.claude/settings.json` (or a repo's `.claude/settings.json`). Use the absolute
-path to where you installed the skill; on Windows, use forward slashes and `python`
-instead of `python3`.
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3 /home/you/.claude/skills/council/scripts/council.py:*)"
-    ]
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read",
-        "hooks": [
-          { "type": "command",
-            "command": "python3 /home/you/.claude/skills/council/scripts/policy_gate.py" }
-        ]
-      }
-    ]
-  }
-}
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-The allow rule is a prefix match on the command Claude runs, so it only saves prompts if
-the interpreter and path match what Claude actually types. Replace `/home/you/...` with
-your real path (for example `/Users/you/...` on macOS or `C:/Users/you/...` on Windows).
+## Smart Routing, Tiers & Global Usage Ledger
 
-What it checks, in short:
+`council.config.json` defines semantic tiers (`fast`, `standard`, `deep`) mapped to each CLI's `--model` and reasoning `--effort` flags, while `delegates.ollama` configures local worker models, context size (`num_ctx`), and `keep_alive`.
 
-- **ask**: push to `main`/`master` or to a branch not named `council/*` or `claude/*`; force,
-  delete, mirror or `--tags` pushes; commit, merge, rebase or reset while on `main`; merges
-  over 400 changed lines; rebase or `reset --hard` of a pushed branch; deleting non-council
-  branches, tags or worktrees; `git clean -f` and `checkout -- .` in the main checkout; global
-  git config; `gh pr merge/ready/close`, non-draft `gh pr create`, `gh repo/release/secret/...`
-  and writing `gh api` calls; dependency installs; recursive deletes outside `.council/`;
-  edits to config files; `COUNCIL_SKIP=1`.
-- **deny**: sandbox-bypass flags, reading CLI credentials, and writing verdict, gate or
-  approval files by hand; `git commit -a` and commits whose staged diff the council has not
-  passed, in repos where the commit gate is on.
+Because subscription rate limits are account-wide across repositories, `council.py` maintains a lightweight rolling ledger in `~/.council/state.json`:
+- Tracks 5-hour and 24-hour dispatch counts per agent.
+- Automatically places a member into a 60-minute cooldown if a run hits `QUOTA` (clearable early with `python scripts/council.py check --clear-cooldown <member|all>`).
+- Queries Ollama's `/api/tags` and `/api/ps` so the Chairman can see which local model is already warm in VRAM.
 
-It splits chained commands (`&&`, `;`, `|`, `&`, newlines, subshells), looks inside
-`bash -c` / `pwsh -Command`, expands git aliases, tracks a `git checkout` earlier in the
-same command, normalises paths (including `..`, `~` and NTFS `::$DATA` suffixes), and checks
-shell writes (`>`, `Set-Content`, `cp`, `sed -i`...) against the same config and forgery rules
-as the Edit tool.
+## How Write Mode Is Confined
 
-Limits: it sees only the chairman's own tool calls, not what a member runs inside its
-sandbox (the sandboxes and the after-run check cover that). It classifies commands with
-simple parsing, so it is a guardrail against mistakes, not a sandbox: an agent set on
-evading it could write a script and run that. Branch ownership is by name (`council/*`,
-`claude/*`), so another session's `claude/*` branch counts as delegated too.
+Every `task` runs on a dedicated branch `council/<run>-[<step>-]<worker>` inside `.council/worktrees/<run>-[<step>-]<worker>`:
 
-## Commit gate (optional, per repo)
+- **Ollama (`ollama`)**: Driven by a thin stdlib HTTP tool loop inside `scripts/council.py` (~500-token system prompt). Python validates every `list_files`, `read_file`, `write_file`, and `edit_file` path *before* touching disk — rejecting worktree escapes, NTFS alternate data streams/aliases, symlinks/junctions, hardlinks, `.git`, `PROTECTED_GLOBS`, and paths outside the brief's `## Allowed paths`. Its zero-argument `run_tests` tool executes **only** the Chairman's `## Test command` from `task.md` (`shell=False`, killing the full process tree on timeout). Note that `run_tests` runs as a local user process without an OS kernel sandbox, so `snapshot()` also hashes `.council` approval/verdict/gate files alongside the main checkout to detect any out-of-bounds tampering. A GPU lock (`~/.council/ollama.lock`) prevents overlapping local runs from thrashing VRAM.
+- **Codex (`codex`)**: Runs `codex exec --sandbox workspace-write --cd <worktree>`. Can edit files and run test commands inside the worktree; network and writes outside the worktree (including `.git/` commits) are blocked.
+- **Claude (`claude`)**: Runs `claude --print --restricted --permission-mode acceptEdits --permission-prompts none --add-dir <worktree>`. Bash/PowerShell/WebFetch are removed and file edits are confined to the worktree; the Chairman runs tests afterward.
+- **Gemini (`gemini` via `agy`)**: Runs `agy --print <prompt> --add-dir <worktree> --mode accept-edits --sandbox`. File edits inside the worktree are allowed; edits elsewhere and all shell commands are auto-denied.
+- **Post-run verification**: Regardless of worker, `council.py` snapshots the main checkout (HEAD, branch, staged/unstaged hashes, untracked hashes, ignored mtimes, git config/hooks, refs, stash) before and after, checks that no commits were made in the worktree, and validates all changed paths against `Allowed paths` and `PROTECTED_GLOBS`. Any breach is flagged `VIOLATION`.
 
-Create `.council/enforce-commit-gate` in a repo to require a passing council review of the
-exact staged diff before Claude can `git commit` there. Restaging anything after approval
-blocks it again. Run folders alone don't turn it on.
+## Review & Fail-Closed Gate Policy
 
-## Gate policy
+- `ollama` is a **non-voting delegate** and never participates in `gate` verdicts.
+- The active `--chairman` and any cloud `--author` of a task worktree are excluded from headless self-review:
+  - **Cloud-authored worktree**: cross-reviewed by the remaining voting council member + Chairman.
+  - **Ollama or Chairman work**: reviewed by both voting council members (with `--require` available for 1-reviewer sign-off on small <50-line Ollama tasks when `.council/enforce-commit-gate` is off).
+- Any `reject` → **REJECT**; any `revise`, `unparseable`, `unavailable`, stale diff fingerprint, or missing required reviewer → **REVISE** (and withdraws any prior `.council/approved.json`); `pass` with a `blocker` or `major` finding is downgraded to `revise`.
 
-- Any member says `reject` → **REJECT**
-- Any `revise`, unparseable reply, member that failed to run, or required reviewer with no
-  verdict (`--require`, default every enabled member) → **REVISE**
-- Any non-pass removes an earlier `.council/approved.json`
-- A `pass` with a blocker or major finding is downgraded to `revise`
-- Reviews of an older diff are marked stale → **REVISE**
-- Otherwise → **PASS**
+## Shared Project Context (`AGENTS.md`) & Policy Hook
+
+- Keep shared repository rules in `AGENTS.md` at the repo root (`codex` and `agy` load it natively; if a repo also has `CLAUDE.md`, start `CLAUDE.md` with `@AGENTS.md`). Both `AGENTS.md` and `CLAUDE.md` are protected in write mode.
+- `scripts/policy_gate.py` enforces the Chairman's Tier 0 / Tier 1 / Tier 2 / Never policy and optional `.council/enforce-commit-gate` commit gate natively in **both** Claude Code (`settings.json`) and Antigravity (`hooks.json`), recognizing `council/*`, `claude/*`, `codex/*`, `agy/*`, and `gemini/*` feature branches.
 
 ## Background
 
-The design started as a salvage of an earlier multi-agent framework (Cantor). See
-[docs/history.md](docs/history.md) for what was kept, what changed, and why.
+Council evolved from an earlier multi-agent framework (Cantor). See [docs/history.md](docs/history.md) for the original design notes.

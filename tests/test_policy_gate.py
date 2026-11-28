@@ -248,6 +248,30 @@ class PolicyGateTest(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), "")
         self.assertEqual(done.returncode, 0)
 
+    def test_agy_hook_protocol_and_multi_chairman_branches(self):
+        # Delegated feature branches for all chairman CLIs are allowed
+        for branch in ("codex/feat", "agy/feat", "gemini/feat"):
+            with self.subTest(branch=branch):
+                self.assertEqual(self.bash(f"git push origin {branch}"), "allow")
+
+        # Antigravity (agy) PreToolUse payloads via subprocess
+        def run_agy(tool_name, **args):
+            payload = {"cwd": str(self.repo), "toolCall": {"id": "1", "name": tool_name, "args": args}}
+            done = subprocess.run([sys.executable, str(Path(policy_gate.__file__))],
+                                  input=json.dumps(payload), capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0)
+            return json.loads(done.stdout)
+
+        self.assertEqual(run_agy("run_command", CommandLine="git status"), {"decision": "allow"})
+        ask_out = run_agy("run_command", CommandLine="git push origin main")
+        self.assertEqual(ask_out["decision"], "force_ask")
+        deny_out = run_agy("read_file", Path="~/.codex/auth.json")
+        self.assertEqual(deny_out["decision"], "deny")
+        cfg_out = run_agy("edit_file", Path=str(self.repo / ".agents" / "hooks.json"))
+        self.assertEqual(cfg_out["decision"], "force_ask")
+        verdict_out = run_agy("write_file", Path=str(self.repo / ".council" / "runs" / "r1" / "codex.verdict.json"))
+        self.assertEqual(verdict_out["decision"], "deny")
+
 
 if __name__ == "__main__":
     unittest.main()

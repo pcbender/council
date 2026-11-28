@@ -44,10 +44,11 @@ class TaskModeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.old_env = {k: os.environ.get(k) for k in ("TEMP", "TMP", "TMPDIR")}
+        self.old_env = {k: os.environ.get(k) for k in ("TEMP", "TMP", "TMPDIR", "COUNCIL_STATE_PATH")}
         (root / "elsewhere").mkdir()
-        for k in self.old_env:  # see the temp-folder guard in council.py
+        for k in ("TEMP", "TMP", "TMPDIR"):  # see the temp-folder guard in council.py
             os.environ[k] = str(root / "elsewhere")
+        os.environ["COUNCIL_STATE_PATH"] = str(root / "state" / "state.json")
         self.repo = root / "repo"
         self.repo.mkdir()
         sh(self.repo, "git", "init", "-q", "-b", "main")
@@ -95,7 +96,7 @@ class TaskModeTest(unittest.TestCase):
         orig = council.ADAPTERS[member].build
         orig_auth = council.ADAPTERS[member].check_auth
         council.ADAPTERS[member].check_auth = lambda self_: "stub authenticated"
-        council.ADAPTERS[member].build = lambda self_, pf, ws, of, write=False: (
+        council.ADAPTERS[member].build = lambda self_, pf, ws, of, write=False, model=None, effort=None: (
             [self_.executable()], pf.read_text(encoding="utf-8"))
         try:
             args = argparse.Namespace(member=member, brief=str(self.run_dir / "task.md"), base=None,
@@ -200,7 +201,7 @@ class TaskModeTest(unittest.TestCase):
         config["members"]["codex"].update(enabled=True, executable=self.stub("good"), extra_args=[])
         orig = council.ADAPTERS["codex"].build
         orig_auth = council.ADAPTERS["codex"].check_auth
-        council.ADAPTERS["codex"].build = lambda self_, pf, ws, of, write=False: (
+        council.ADAPTERS["codex"].build = lambda self_, pf, ws, of, write=False, model=None, effort=None: (
             [self_.executable()], pf.read_text(encoding="utf-8"))
         council.ADAPTERS["codex"].check_auth = lambda self_: "stub authenticated"
         try:
@@ -229,10 +230,44 @@ class TaskModeTest(unittest.TestCase):
         with self.assertRaises(council.MemberUnavailable):
             adapter.executable()
 
-    def test_claude_cannot_write(self):
-        args = argparse.Namespace(member="claude", brief=str(self.run_dir / "task.md"), base=None,
-                                  workspace=None, timeout=60)
-        self.assertEqual(council.cmd_task(args, council.load_config()), 2)
+    def test_claude_write_mode_and_unknown_worker_refused(self):
+        code, rec = self.run_task("good", member="claude")
+        self.assertEqual(code, 0)
+        self.assertEqual(rec["status"], "DONE")
+        self.assertEqual(rec["branch"], "council/t1-claude")
+        bad_args = argparse.Namespace(member="bogus", brief=str(self.run_dir / "task.md"), base=None,
+                                      workspace=None, timeout=60)
+        self.assertEqual(council.cmd_task(bad_args, council.load_config()), 2)
+
+    def test_task_id_isolates_subtasks_in_one_run_dir(self):
+        config = council.load_config()
+        for m in ("codex", "claude"):
+            config["members"][m].update(enabled=True, executable=self.stub("good"), model=None, extra_args=[])
+        patches = {}
+        for m in ("codex", "claude"):
+            patches[m] = (council.ADAPTERS[m].build, council.ADAPTERS[m].check_auth)
+            council.ADAPTERS[m].check_auth = lambda self_: "stub ok"
+            council.ADAPTERS[m].build = lambda self_, pf, ws, of, write=False, model=None, effort=None: (
+                [self_.executable()], pf.read_text(encoding="utf-8"))
+        try:
+            a1 = argparse.Namespace(member="codex", task_id="step1", brief=str(self.run_dir / "task.md"),
+                                    base=None, workspace=None, timeout=60)
+            a2 = argparse.Namespace(member="claude", task_id="step2", brief=str(self.run_dir / "task.md"),
+                                    base=None, workspace=None, timeout=60)
+            self.assertEqual(council.cmd_task(a1, config), 0)
+            self.assertEqual(council.cmd_task(a2, config), 0)
+        finally:
+            for m, (orig_b, orig_a) in patches.items():
+                council.ADAPTERS[m].build = orig_b
+                council.ADAPTERS[m].check_auth = orig_a
+        r1 = json.loads((self.run_dir / "step1-codex.task.json").read_text())
+        r2 = json.loads((self.run_dir / "step2-claude.task.json").read_text())
+        self.assertEqual(r1["branch"], "council/t1-step1-codex")
+        self.assertEqual(r2["branch"], "council/t1-step2-claude")
+        council.cmd_cleanup(argparse.Namespace(dir=str(self.run_dir), member=None, task_id=None,
+                                               workspace=None, discard=True), config)
+        self.assertFalse(Path(r1["worktree"]).exists())
+        self.assertFalse(Path(r2["worktree"]).exists())
 
     def test_helpers(self):
         self.assertTrue(council.glob_match("src/a/b.py", "src/**"))

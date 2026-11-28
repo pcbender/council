@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
-"""Council member runner — salvaged from Cantor's CliExecutor.
+"""Council runner — multi-chairman subscription council + local Ollama delegate.
 
-Runs one council member (codex, gemini via Antigravity `agy`, or claude) headless
-on your subscription login, captures its answer to a file, and — in review mode —
-parses a structured verdict.
+Runs voting cloud council members (codex, gemini via Antigravity `agy`, claude)
+headless on your subscription logins, and dispatches bounded write tasks to
+either a cloud member or a non-voting local Ollama worker inside an isolated
+git worktree.
 
-Stdlib only. Native Windows first; also works on macOS/Linux.
+Stdlib only (plus optional `pywinpty` on Windows for agy's non-TTY fallback).
 
 Usage:
-  python council.py check
-  python council.py consult --member codex  --brief .council/runs/<id>/brief.md  # how would you approach it?
-  python council.py ask     --member codex  --brief .council/runs/<id>/brief.md  # open question
+  python council.py check   [--chairman auto|claude|codex|gemini] [--json]
+  python council.py consult --member codex  --brief .council/runs/<id>/brief.md [--tier standard]
+  python council.py ask     --member claude --brief .council/runs/<id>/brief.md
   python council.py review  --member gemini --brief .council/runs/<id>/brief.md
-  python council.py gate    --dir .council/runs/<id>      # combine verdicts, stamp the diff
-  python council.py task    --member codex  --brief .council/runs/<id>/task.md [--base BRANCH]
-  python council.py cleanup --dir .council/runs/<id> [--member codex]
-
-Members are read-only in consult/ask/review. In `task` (write mode) one member edits files
-inside its own git worktree under .council/worktrees/; it cannot commit, push or write
-outside that worktree, and the runner checks afterwards that it didn't.
+  python council.py gate    --dir .council/runs/<id> [--chairman auto] [--author ollama]
+  python council.py task    --member ollama --brief .council/runs/<id>/task.md [--task-id step1] [--tier fast]
+  python council.py cleanup --dir .council/runs/<id> [--member ollama] [--task-id step1]
+  python council.py install [--with-hooks] [--force]
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -31,18 +30,19 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
 CONFIG_PATH = SKILL_ROOT / "council.config.json"
+STATE_PATH = Path(os.environ.get("COUNCIL_STATE_PATH") or (Path.home() / ".council" / "state.json"))
+HISTORY_RETENTION_SECONDS = 7 * 86400
 
 # ---------------------------------------------------------------------------
 # Environment scrubbing (from Cantor cli_env.py)
-# Cantor's allowlist was POSIX-only (HOME, PATH, TERM...). On native Windows the
-# CLIs also need USERPROFILE / APPDATA / SystemRoot etc. or they can't find their
-# auth files or even start. Those are added here.
 # ---------------------------------------------------------------------------
 SAFE_ENV_KEYS = {
     "HOME", "LANG", "LC_ALL", "PATH", "TERM", "TZ", "TMPDIR",
@@ -72,29 +72,282 @@ def scrubbed_env() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config & Chairman / Tier resolution
 # ---------------------------------------------------------------------------
+CLOUD_MEMBERS = ("codex", "gemini", "claude")
+TIERS = ("fast", "standard", "deep")
+
 DEFAULT_CONFIG = {
     "timeout_seconds": 900,
+    "quota_cooldown_seconds": 3600,
     "members": {
-        "codex": {"enabled": True, "executable": "codex", "model": None, "extra_args": [],
-                  "role": "Adversarial code reviewer: correctness, edge cases, bugs."},
-        "gemini": {"enabled": True, "executable": "agy", "model": None, "extra_args": [],
-                   "role": "Whole-repo critic: architecture, consistency, what was missed."},
-        "claude": {"enabled": False, "executable": "claude", "model": None, "extra_args": [],
-                   "role": "Fresh-context second opinion."},
+        "codex": {
+            "enabled": True, "executable": "codex", "model": None, "extra_args": [],
+            "tiers": {
+                "fast": {"model": None, "effort": "low"},
+                "standard": {"model": None, "effort": "medium"},
+                "deep": {"model": None, "effort": "high"},
+            },
+            "role": "Adversarial code reviewer: correctness, edge cases, concurrency, bugs, security.",
+        },
+        "gemini": {
+            "enabled": True, "executable": "agy", "model": None, "extra_args": [],
+            "tiers": {
+                "fast": {"model": None, "effort": "low"},
+                "standard": {"model": None, "effort": "medium"},
+                "deep": {"model": None, "effort": "high"},
+            },
+            "role": "Whole-repo critic: architecture, consistency, what was missed.",
+        },
+        "claude": {
+            "enabled": True, "executable": "claude", "model": None, "extra_args": [],
+            "tiers": {
+                "fast": {"model": "sonnet", "effort": "low"},
+                "standard": {"model": "sonnet", "effort": "medium"},
+                "deep": {"model": "opus", "effort": "high"},
+            },
+            "role": "Pragmatic implementer & API reviewer: clarity, maintainability, failure handling.",
+        },
+    },
+    "delegates": {
+        "ollama": {
+            "enabled": True,
+            "base_url": "http://127.0.0.1:11434",
+            "keep_alive": "30m",
+            "num_ctx": 16384,
+            "max_steps": 25,
+            "test_timeout_seconds": 120,
+            "tiers": {
+                "fast": {"model": "qwen2.5-coder:14b"},
+                "standard": {"model": "qwen2.5-coder:14b"},
+                "deep": {"model": "qwen3-coder:30b-a3b"},
+            },
+            "role": "Local implementation worker: execute bounded file edits and iterate against tests.",
+        }
     },
 }
+
+
+def _merge_actor_group(dst: dict, src: dict) -> None:
+    for name, values in (src or {}).items():
+        if not isinstance(values, dict):
+            continue
+        entry = dst.setdefault(name, {})
+        tiers = values.get("tiers")
+        for k, v in values.items():
+            if k != "tiers":
+                entry[k] = v
+        if isinstance(tiers, dict):
+            dst_tiers = entry.setdefault("tiers", {})
+            for t_name, t_vals in tiers.items():
+                if isinstance(t_vals, dict):
+                    dst_tiers.setdefault(t_name, {}).update(t_vals)
 
 
 def load_config() -> dict:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_PATH.is_file():
         user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        config["timeout_seconds"] = user.get("timeout_seconds", config["timeout_seconds"])
-        for name, values in user.get("members", {}).items():
-            config["members"].setdefault(name, {}).update(values)
+        for scalar in ("timeout_seconds", "quota_cooldown_seconds"):
+            if scalar in user:
+                config[scalar] = user[scalar]
+        _merge_actor_group(config["members"], user.get("members") or {})
+        _merge_actor_group(config["delegates"], user.get("delegates") or {})
     return config
+
+
+CHAIRMAN_ALIASES = {"agy": "gemini", "antigravity": "gemini"}
+
+
+def detect_chairman(env: dict[str, str] | None = None) -> str | None:
+    environ = os.environ if env is None else env
+    explicit = environ.get("COUNCIL_CHAIRMAN", "").strip().lower()
+    if explicit:
+        explicit = CHAIRMAN_ALIASES.get(explicit, explicit)
+        if explicit in CLOUD_MEMBERS:
+            return explicit
+    if environ.get("CLAUDECODE") == "1" or "CLAUDE_CODE_ENTRYPOINT" in environ:
+        return "claude"
+    if any(k in environ for k in ("CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI")):
+        return "codex"
+    if any(k.startswith("ANTIGRAVITY_") for k in environ):
+        return "gemini"
+    return None
+
+
+def resolve_chairman(value: str | None, env: dict[str, str] | None = None) -> str | None:
+    if not value:
+        return None
+    norm = CHAIRMAN_ALIASES.get(value.strip().lower(), value.strip().lower())
+    if norm == "auto":
+        return detect_chairman(env)
+    if norm not in CLOUD_MEMBERS:
+        raise ValueError(f"Unknown chairman '{value}' (expected claude, codex, gemini, or auto).")
+    return norm
+
+
+def resolve_tier(cfg: dict, tier: str | None = None, model: str | None = None,
+                 effort: str | None = None) -> tuple[str | None, str | None]:
+    tier_cfg = (cfg.get("tiers") or {}).get(tier or "") or {}
+    resolved_model = model if model is not None else (
+        tier_cfg.get("model") if tier and tier_cfg.get("model") is not None else cfg.get("model")
+    )
+    resolved_effort = effort if effort is not None else tier_cfg.get("effort")
+    return resolved_model, resolved_effort
+
+
+# ---------------------------------------------------------------------------
+# Global usage & quota ledger (~/.council/state.json)
+# ---------------------------------------------------------------------------
+def _state_file() -> Path:
+    override = os.environ.get("COUNCIL_STATE_PATH")
+    return Path(override) if override else STATE_PATH
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        out = float(val)
+        return out if out == out and out not in (float("inf"), float("-inf")) else default
+    except (TypeError, ValueError):
+        return default
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path, timeout: float = 10.0):
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "a+b")
+    except OSError:
+        yield
+        return
+    start = time.time()
+    locked = False
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.time() - start > timeout:
+                    raise TimeoutError(f"Timed out waiting for lock {lock_path}")
+                time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def _read_state_unlocked(path: Path) -> dict:
+    if not path.is_file():
+        return {"history": [], "cooldowns": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {
+                "history": data.get("history") if isinstance(data.get("history"), list) else [],
+                "cooldowns": data.get("cooldowns") if isinstance(data.get("cooldowns"), dict) else {},
+            }
+    except (OSError, ValueError):
+        pass
+    return {"history": [], "cooldowns": {}}
+
+
+def load_state() -> dict:
+    return _read_state_unlocked(_state_file())
+
+
+def _write_state_unlocked(path: Path, state: dict) -> None:
+    now = time.time()
+    cutoff = now - HISTORY_RETENTION_SECONDS
+    state["history"] = [h for h in state.get("history", [])
+                        if isinstance(h, dict) and _safe_float(h.get("ts")) >= cutoff][-500:]
+    state["cooldowns"] = {
+        k: v for k, v in state.get("cooldowns", {}).items()
+        if isinstance(v, dict) and _safe_float(v.get("until")) > now
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def save_state(state: dict) -> None:
+    path = _state_file()
+    with contextlib.suppress(TimeoutError), _file_lock(path.with_suffix(".lock")):
+        _write_state_unlocked(path, state)
+
+
+def record_usage(target: str, kind: str, result: "RunResult", tier: str | None = None,
+                 model: str | None = None, cooldown_seconds: int = 3600) -> None:
+    path = _state_file()
+    with contextlib.suppress(OSError, TimeoutError), _file_lock(path.with_suffix(".lock")):
+        now = time.time()
+        state = _read_state_unlocked(path)
+        state["history"].append({
+            "ts": round(now, 2),
+            "target": target,
+            "kind": kind,
+            "tier": tier,
+            "model": model,
+            "ok": result.ok,
+            "quota_hit": result.quota_hit,
+            "seconds": result.seconds,
+        })
+        if result.quota_hit and cooldown_seconds > 0:
+            state["cooldowns"][target] = {
+                "until": round(now + cooldown_seconds, 2),
+                "reason": f"QUOTA hit during {kind}",
+            }
+        elif result.ok and target in state["cooldowns"]:
+            del state["cooldowns"][target]
+        _write_state_unlocked(path, state)
+
+
+def usage_summary(target: str, state: dict | None = None, now: float | None = None) -> dict:
+    st = load_state() if state is None else state
+    ts_now = time.time() if now is None else now
+    hist = [h for h in st.get("history", []) if isinstance(h, dict) and h.get("target") == target]
+    runs_5h = sum(1 for h in hist if ts_now - _safe_float(h.get("ts")) <= 5 * 3600)
+    runs_24h = sum(1 for h in hist if ts_now - _safe_float(h.get("ts")) <= 86400)
+    quota_24h = sum(1 for h in hist if h.get("quota_hit") and ts_now - _safe_float(h.get("ts")) <= 86400)
+    cd = st.get("cooldowns", {}).get(target) or {}
+    rem = max(0, int(round(_safe_float(cd.get("until")) - ts_now))) if isinstance(cd, dict) else 0
+    return {
+        "runs_5h": runs_5h,
+        "runs_24h": runs_24h,
+        "quota_hits_24h": quota_24h,
+        "cooldown_remaining_s": rem,
+        "available_quota": rem == 0,
+    }
+
+
+def clear_cooldown(target: str) -> None:
+    path = _state_file()
+    with contextlib.suppress(OSError, TimeoutError), _file_lock(path.with_suffix(".lock")):
+        state = _read_state_unlocked(path)
+        if target == "all":
+            state["cooldowns"] = {}
+        else:
+            state["cooldowns"].pop(target, None)
+        _write_state_unlocked(path, state)
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +365,8 @@ class RunResult:
     auth_problem: bool = False
     used_pty: bool = False
     denied: str = ""
+    model_used: str | None = None
+    effort_used: str | None = None
     seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
 
@@ -120,7 +375,7 @@ class MemberUnavailable(RuntimeError):
     pass
 
 
-def looks_like_quota(text: str) -> bool:  # Cantor map_quota
+def looks_like_quota(text: str) -> bool:
     t = text.lower()
     return any(s in t for s in ("rate limit", "quota", "usage limit", "resource_exhausted"))
 
@@ -132,11 +387,10 @@ def looks_like_auth(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Adapters (from Cantor CliExecutor). Read-only by default; write=True is the
-# task mode, where a member may edit files inside one worktree and nothing else.
+# Cloud Adapters (read-only by default; write=True confines edits to worktree)
 # ---------------------------------------------------------------------------
 SANDBOX_BYPASS = ("danger-full-access", "--dangerously-bypass-approvals-and-sandbox",
-                  "--dangerously-skip-permissions", "--yolo")
+                  "--dangerously-skip-permissions", "--yolo", "bypasspermissions")
 
 
 class Adapter:
@@ -152,15 +406,25 @@ class Adapter:
                 raise MemberUnavailable(f"extra_args contains a sandbox bypass ({arg}); refused.")
         exe = self.cfg.get("executable") or self.name
         resolved = shutil.which(exe)
+        if not resolved and os.name == "nt" and exe.lower().endswith(".ps1"):
+            alt = exe[:-4] + ".cmd"
+            resolved = shutil.which(alt) or (alt if Path(alt).is_file() else None)
+        if not resolved and Path(exe).is_file():
+            resolved = str(Path(exe).resolve())
         if not resolved:
             raise MemberUnavailable(f"{self.label} not found on PATH: {exe}")
+        if os.name == "nt" and resolved.lower().endswith(".ps1"):
+            cmd_sibling = Path(resolved).with_suffix(".cmd")
+            if cmd_sibling.is_file():
+                return str(cmd_sibling)
         return resolved
 
     def check_auth(self) -> str:
         return "not checked"
 
     def build(self, prompt_file: Path, workspace: Path, out_file: Path,
-              write: bool = False) -> tuple[list[str], str | None]:
+              write: bool = False, model: str | None = None,
+              effort: str | None = None) -> tuple[list[str], str | None]:
         """Return (argv, stdin_text)."""
         raise NotImplementedError
 
@@ -185,16 +449,16 @@ class CodexAdapter(Adapter):
             raise MemberUnavailable("Codex auth contains an API key (would bill the API).")
         return "ChatGPT subscription"
 
-    def build(self, prompt_file, workspace, out_file, write=False):
-        # workspace-write confines writes to `workspace` (tested on Windows: no writes to
-        # the parent folder or the main checkout, and no `git add`/`commit`, because a
-        # linked worktree's git metadata lives outside it). Network stays off.
+    def build(self, prompt_file, workspace, out_file, write=False, model=None, effort=None):
         sandbox = "workspace-write" if write else "read-only"
         argv = [self.executable(), "exec", "--sandbox", sandbox,
                 "--skip-git-repo-check", "--cd", str(workspace),
                 "--output-last-message", str(out_file)]
-        if self.cfg.get("model"):
-            argv += ["--model", self.cfg["model"]]
+        chosen_model = model if model is not None else self.cfg.get("model")
+        if chosen_model:
+            argv += ["--model", chosen_model]
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
         argv += list(self.cfg.get("extra_args", []))
         argv.append("-")  # prompt on stdin: no argv length limit on Windows
         return argv, prompt_file.read_text(encoding="utf-8")
@@ -221,36 +485,42 @@ class ClaudeAdapter(Adapter):
             raise MemberUnavailable("Claude CLI appears to be on API-key auth.")
         return "claude.ai subscription"
 
-    def build(self, prompt_file, workspace, out_file, write=False):
+    def build(self, prompt_file, workspace, out_file, write=False, model=None, effort=None):
+        exe = self.executable()
         if write:
-            raise MemberUnavailable("Write mode is only supported for codex and gemini.")
-        argv = [self.executable(), "--print", "--input-format", "text",
-                "--output-format", "text", "--permission-mode", "plan",
-                "--no-session-persistence"]
-        if self.cfg.get("model"):
-            argv += ["--model", self.cfg["model"]]
+            # --restricted removes Bash/PowerShell/WebFetch and confines file edits to
+            # working directories (--add-dir); --permission-prompts none auto-denies
+            # anything outside acceptEdits (such as settings/git config writes).
+            argv = [exe, "--print", "--input-format", "text", "--output-format", "text",
+                    "--restricted", "--permission-mode", "acceptEdits",
+                    "--permission-prompts", "none", "--no-session-persistence",
+                    "--add-dir", str(workspace)]
+        else:
+            argv = [exe, "--print", "--input-format", "text", "--output-format", "text",
+                    "--permission-mode", "plan", "--permission-prompts", "none",
+                    "--no-session-persistence", "--add-dir", str(workspace),
+                    "--add-dir", str(prompt_file.parent)]
+            main = main_checkout(workspace)
+            if main is not None:
+                argv += ["--add-dir", str(main)]
+        chosen_model = model if model is not None else self.cfg.get("model")
+        if chosen_model:
+            argv += ["--model", chosen_model]
+        if effort:
+            argv += ["--effort", effort]
         argv += list(self.cfg.get("extra_args", []))
         return argv, prompt_file.read_text(encoding="utf-8")
 
 
 class GeminiAgyAdapter(Adapter):
-    """Gemini via Antigravity CLI (`agy`). Replaces Cantor's GeminiCliAdapter:
-    Gemini CLI stopped serving Google AI Pro/Ultra accounts on 2026-06-18.
-
-    The prompt is NOT passed on argv (Windows ~32K limit). agy is told to read the
-    brief file from the workspace instead.
-    """
+    """Gemini via Antigravity CLI (`agy`)."""
     name, label = "gemini", "Antigravity CLI (agy)"
 
     def check_auth(self) -> str:
         return "cached agy login (run `agy` once interactively if this fails)"
 
-    def build(self, prompt_file, workspace, out_file, write=False):
+    def build(self, prompt_file, workspace, out_file, write=False, model=None, effort=None):
         if write:
-            # Headless accept-edits (tested): file edits inside --add-dir are allowed,
-            # edits outside it and ALL shell commands are auto-denied, and a denial ends
-            # the run. The prompt goes inline so agy needs no access to the run folder
-            # (where verdict files live).
             prompt = prompt_file.read_text(encoding="utf-8")
             if self.executable().lower().endswith((".cmd", ".bat")):
                 raise MemberUnavailable("agy resolves to a .cmd/.bat wrapper, which would mangle the "
@@ -268,30 +538,28 @@ class GeminiAgyAdapter(Adapter):
                 "denied and end your run, so use your file-reading tools only. "
                 "Reply with your answer only."
             )
-            # --mode plan enforces read-only instead of relying on the instruction alone.
-            # The brief's folder is added too: headless agy auto-denies reads outside
-            # its workspace (e.g. reviewing a worktree with the brief in the main repo).
             argv = [self.executable(), "--print", instruction, "--add-dir", str(workspace),
                     "--add-dir", str(prompt_file.parent), "--mode", "plan"]
-            # Reviewing a linked worktree, agy tends to open the main checkout's copy of a
-            # file to compare; that read is denied and ends the run. Plan mode is read-only.
             main = main_checkout(workspace)
             if main is not None:
                 argv[-2:-2] = ["--add-dir", str(main)]
-        if self.cfg.get("model"):
-            argv += ["--model", self.cfg["model"]]
+        chosen_model = model if model is not None else self.cfg.get("model")
+        if chosen_model:
+            argv += ["--model", chosen_model]
+        if effort:
+            argv += ["--effort", effort]
         argv += list(self.cfg.get("extra_args", []))
         return argv, None
 
 
 ADAPTERS = {"codex": CodexAdapter, "gemini": GeminiAgyAdapter, "claude": ClaudeAdapter}
-WRITE_MEMBERS = ("codex", "gemini")
-MAX_INLINE_PROMPT = 24000  # Windows command lines top out at 32,767 chars
+WRITE_MEMBERS = ("codex", "gemini", "claude", "ollama")
+MAX_INLINE_PROMPT = 24000
 AGY_DENIED = re.compile(r"no output produced.*?required the \"(\w+)\" permission", re.S)
 
 
 # ---------------------------------------------------------------------------
-# Execution, with the agy non-TTY workaround
+# Cloud CLI execution, with the agy non-TTY workaround
 # ---------------------------------------------------------------------------
 def _run_plain(argv, stdin_text, cwd, timeout):
     return subprocess.run(argv, input=stdin_text, cwd=cwd, text=True, encoding="utf-8",
@@ -354,13 +622,16 @@ def _run_pty(argv, cwd, timeout) -> tuple[str, int]:
 
 
 def run_member(name: str, prompt_file: Path, workspace: Path, out_dir: Path, cfg: dict,
-               timeout: int, write: bool = False) -> RunResult:
+               timeout: int, write: bool = False, model: str | None = None,
+               effort: str | None = None, unit: str | None = None) -> RunResult:
     adapter = ADAPTERS[name](cfg)
-    out_file = out_dir / f"{name}.raw.md"
-    result = RunResult(member=name, ok=False)
+    out_file = out_dir / f"{unit or name}.raw.md"
+    with contextlib.suppress(OSError):
+        out_file.unlink()
+    result = RunResult(member=name, ok=False, model_used=model or cfg.get("model"), effort_used=effort)
     start = time.time()
     try:
-        adapter.executable()  # a missing binary is FAILED, not AUTH
+        adapter.executable()
     except MemberUnavailable as exc:
         result.notes.append(str(exc))
         result.seconds = round(time.time() - start, 1)
@@ -377,13 +648,14 @@ def run_member(name: str, prompt_file: Path, workspace: Path, out_dir: Path, cfg
 
     def tree_state() -> str:
         if (gitfile.read_bytes() if gitfile.is_file() else b"missing") != pointer:
-            return "\0pointer changed"  # don't run git against a repo the member may control
+            return "\0pointer changed"
         return "".join(subprocess.run(["git", "-C", str(workspace), *cmd], capture_output=True,
                                       text=True, encoding="utf-8", errors="replace").stdout
                        for cmd in (["status", "--porcelain"], ["diff", "HEAD"]))
     before_state = tree_state() if write else ""
     try:
-        argv, stdin_text = adapter.build(prompt_file, workspace, out_file, write=write)
+        argv, stdin_text = adapter.build(prompt_file, workspace, out_file,
+                                         write=write, model=model, effort=effort)
         try:
             done = _run_plain(argv, stdin_text, workspace, timeout)
             result.exit_code, result.stderr = done.returncode, done.stderr
@@ -391,7 +663,6 @@ def run_member(name: str, prompt_file: Path, workspace: Path, out_dir: Path, cfg
             if name == "gemini" and done.returncode == 0 and not text.strip():
                 changed = write and tree_state() != before_state
                 if changed:
-                    # Re-running a write task would apply its edits twice.
                     result.notes.append("Empty report on pipe; edits were made, so not re-run.")
                     text = "(agy made edits but its report was lost to the non-TTY bug)"
                 else:
@@ -423,8 +694,549 @@ def run_member(name: str, prompt_file: Path, workspace: Path, out_dir: Path, cfg
 
 
 # ---------------------------------------------------------------------------
-# Verdicts (new — Cantor's reviews were human-only decisions; this is the
-# cross-vendor structured verdict Cantor explored but never shipped)
+# Local Ollama Worker Delegate (stdlib HTTP + Python-enforced path confinement)
+# ---------------------------------------------------------------------------
+OLLAMA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+OLLAMA_SYSTEM_PROMPT = """You are a focused local coding worker executing a bounded task inside a git worktree.
+Follow the task brief carefully:
+1. Read relevant files before editing so line contents match accurately.
+2. Stay strictly within the allowed paths and never touch git or config files.
+3. Prefer `edit_file` for targeted changes and `write_file` for new or full-file rewrites.
+4. If `run_tests` is available, run it after making changes and fix any failures.
+5. Once complete, stop calling tools and reply with:
+## Changed
+- <files and summary>
+## Tested
+- <test result or "not run">
+## Unsure
+- <anything left uncertain or "nothing">
+"""
+
+
+def _ollama_http(base_url: str, endpoint: str, payload: dict | None = None, timeout: float = 10.0) -> dict:
+    url = base_url.rstrip("/") + endpoint
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if data is not None else "GET")
+    with OLLAMA_OPENER.open(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def ollama_status(base_url: str, timeout: float = 4.0) -> tuple[bool, list[str], list[str], str]:
+    """Return (reachable, installed_models, warm_models, error_detail)."""
+    try:
+        tags_data = _ollama_http(base_url, "/api/tags", timeout=timeout)
+        installed = [m["name"] for m in tags_data.get("models", [])
+                     if isinstance(m, dict) and isinstance(m.get("name"), str)]
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        return False, [], [], f"Ollama unreachable at {base_url}: {exc}"
+    warm = []
+    try:
+        ps_data = _ollama_http(base_url, "/api/ps", timeout=timeout)
+        warm = [m["name"] for m in ps_data.get("models", [])
+                if isinstance(m, dict) and isinstance(m.get("name"), str)]
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
+    return True, installed, warm, ""
+
+
+def select_ollama_model(desired: str | None, installed: list[str],
+                        warm: list[str]) -> tuple[str, str | None]:
+    if not installed:
+        raise MemberUnavailable("No Ollama models are installed (run `ollama pull <model>`).")
+    if desired:
+        for candidate in (desired, f"{desired}:latest"):
+            if candidate in installed:
+                return candidate, None
+    coding_hints = ("coder", "codestral", "devstral", "qwen", "deepseek", "llama", "gemma")
+    for pool in (warm, installed):
+        for hint in coding_hints:
+            for name in pool:
+                if hint in name.lower():
+                    note = (f"Configured model '{desired}' not installed; fell back to '{name}'."
+                            if desired else None)
+                    return name, note
+    chosen = warm[0] if warm else installed[0]
+    note = f"Configured model '{desired}' not installed; fell back to '{chosen}'." if desired else None
+    return chosen, note
+
+
+def parse_test_command(brief_text: str) -> str | None:
+    m = re.search(r"^#+\s*Test command\s*$(.*?)(?=^#|\Z)", brief_text, re.M | re.S | re.I)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    fenced = re.search(r"```(?:[A-Za-z0-9_-]+)?\s*\n(.*?)\n```", body, re.S)
+    if fenced:
+        lines = [ln.strip() for ln in fenced.group(1).splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        return lines[0] if lines else None
+    for raw in body.splitlines():
+        line = re.sub(r"^\s*[-*]\s+", "", raw).strip().strip("`").strip()
+        if line and not line.startswith("#"):
+            return line
+    return None
+
+
+@contextlib.contextmanager
+def _ollama_gpu_lock(timeout: float = 600.0):
+    with _file_lock(_state_file().parent / "ollama.lock", timeout=timeout):
+        yield
+
+
+DOS_SHORT_RE = re.compile(r"~\d+(?:\.|$)")
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    if hasattr(path, "is_junction") and path.is_junction():
+        return True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _safe_worktree_target(wt: Path, raw_path: str, allowed: list[str],
+                          for_write: bool) -> tuple[Path | None, str | None, str | None]:
+    """Validate `raw_path` inside `wt`. Returns (resolved_path, posix_rel, error_msg)."""
+    if not raw_path or not isinstance(raw_path, str):
+        return None, None, "Error: path must be a non-empty string."
+    if "\0" in raw_path:
+        return None, None, "Error: invalid NUL byte in path."
+    wt_root = wt.resolve()
+    cleaned = raw_path.strip().replace("\\", "/")
+    candidate = Path(cleaned)
+    if candidate.is_absolute():
+        try:
+            rel_from_wt = candidate.resolve().relative_to(wt_root).as_posix()
+        except (OSError, ValueError):
+            return None, None, f"Error: path '{raw_path}' escapes the worktree."
+        cleaned = rel_from_wt or "."
+
+    raw_parts = [p for p in cleaned.split("/") if p not in ("", ".")]
+    for part in raw_parts:
+        if part == "..":
+            return None, None, f"Error: path '{raw_path}' escapes the worktree."
+        if ":" in part or part.endswith((".", " ")) or DOS_SHORT_RE.search(part):
+            return None, None, f"Error: path component '{part}' uses disallowed stream/alias syntax."
+
+    cur = wt_root
+    for part in raw_parts:
+        cur = cur / part
+        if _is_link_or_reparse(cur):
+            return None, None, f"Error: symlink or junction path '{raw_path}' is not permitted."
+    try:
+        if cur.exists() and not cur.is_dir():
+            st = os.lstat(cur)
+            if getattr(st, "st_nlink", 1) > 1:
+                return None, None, f"Error: hard-linked file '{raw_path}' is not permitted."
+        if not cur.resolve().is_relative_to(wt_root):
+            return None, None, f"Error: path '{raw_path}' escapes the worktree."
+    except (OSError, ValueError):
+        return None, None, f"Error: invalid path '{raw_path}'."
+
+    rel = "/".join(raw_parts)
+    if rel == ".git" or rel.startswith(".git/") or any(p.lower() == ".git" for p in raw_parts):
+        return None, None, "Error: accessing .git is forbidden."
+    if rel and any(glob_match(rel, g) for g in PROTECTED_GLOBS):
+        return None, None, f"Error: '{rel}' is a protected path."
+    if for_write and rel and allowed and not any(glob_match(rel, g) for g in allowed):
+        return None, None, (f"Error: '{rel}' is outside the brief's Allowed paths "
+                            f"({', '.join(allowed)}).")
+    return cur, rel, None
+
+
+def _ollama_tools(has_test_cmd: bool) -> list[dict]:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files inside a directory of the worktree.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "directory": {"type": "string", "description": "Relative directory path (default '.')"}
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read lines from a file in the worktree (with line numbers).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path to the file"},
+                        "start_line": {"type": "integer", "description": "1-based start line (default 1)"},
+                        "end_line": {"type": "integer", "description": "1-based end line (default 300)"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create or overwrite a file in the worktree with full contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path to write"},
+                        "content": {"type": "string", "description": "Complete file content"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Replace an exact unique block of text in an existing file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path to modify"},
+                        "old_text": {"type": "string", "description": "Exact existing text to replace"},
+                        "new_text": {"type": "string", "description": "Replacement text"},
+                    },
+                    "required": ["path", "old_text", "new_text"],
+                },
+            },
+        },
+    ]
+    if has_test_cmd:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "run_tests",
+                "description": "Run the task's configured test command inside the worktree.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        })
+    return tools
+
+
+TOOL_CACHE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis"}
+SKIP_WALK_DIRS = {".git", "node_modules", ".venv", "venv", ".council", ".claude", ".agents",
+                  ".agent", ".codex", ".gemini", ".github", ".canto", *TOOL_CACHE_DIRS}
+
+
+def _split_test_argv(cmd: str) -> list[str]:
+    import shlex
+    parts = shlex.split(cmd, posix=(os.name != "nt"))
+    if os.name == "nt":
+        parts = [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in ("'", '"') else p
+                 for p in parts]
+    if not parts:
+        raise ValueError("Empty test command.")
+    return parts
+
+
+def _run_test_process(test_cmd: str, wt: Path, timeout_s: float) -> tuple[int, str, bool]:
+    """Run `test_cmd` without a shell, killing its entire process tree on timeout."""
+    import signal
+    argv = _split_test_argv(test_cmd)
+    env = scrubbed_env()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, cwd=str(wt), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            env=env, **kwargs)
+    try:
+        out, err = proc.communicate(timeout=max(1.0, timeout_s))
+        combined = (out + ("\n" + err if err else "")).strip()
+        return proc.returncode or 0, combined, False
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, check=False)
+        else:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=2)
+        return -1, "", True
+
+
+def _write_utf8_atomic(target: Path, text: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    os.replace(tmp, target)
+
+
+def _exec_ollama_tool(name: str, raw_args, wt: Path, allowed: list[str],
+                      test_cmd: str | None, test_timeout: float) -> str:
+    try:
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args) if raw_args.strip() else {}
+            except ValueError:
+                return f"Error: invalid JSON tool arguments: {raw_args}"
+            if not isinstance(parsed, dict):
+                return "Error: tool arguments JSON must be an object."
+            args = parsed
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        elif raw_args is None:
+            args = {}
+        else:
+            return "Error: tool arguments must be a JSON object."
+
+        if name == "list_files":
+            sub = str(args.get("directory") or ".")
+            target, _, err = _safe_worktree_target(wt, sub, allowed, for_write=False)
+            if err or target is None:
+                return err or "Error: invalid directory."
+            if not target.is_dir():
+                return f"Error: '{sub}' is not a directory."
+            entries = []
+            wt_root = wt.resolve()
+            for root, dirs, files in os.walk(target, followlinks=False):
+                kept_dirs = []
+                for d in sorted(dirs):
+                    if d.lower() in {s.lower() for s in SKIP_WALK_DIRS}:
+                        continue
+                    d_path = Path(root) / d
+                    if _is_link_or_reparse(d_path):
+                        continue
+                    kept_dirs.append(d)
+                dirs[:] = kept_dirs
+                for fname in sorted(files):
+                    fpath = Path(root) / fname
+                    if _is_link_or_reparse(fpath):
+                        continue
+                    rel = fpath.resolve().relative_to(wt_root).as_posix()
+                    if rel == ".git" or any(glob_match(rel, g) for g in PROTECTED_GLOBS):
+                        continue
+                    entries.append(rel)
+                    if len(entries) >= 200:
+                        return "\n".join(entries) + "\n... (truncated at 200 files)"
+            return "\n".join(entries) if entries else "(empty directory)"
+
+        if name == "read_file":
+            target, rel, err = _safe_worktree_target(wt, str(args.get("path") or ""), allowed, for_write=False)
+            if err or target is None or not rel:
+                return err or "Error: file path is required."
+            if not target.is_file():
+                return f"Error: file '{rel}' does not exist."
+            try:
+                raw_bytes = target.read_bytes()
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                return f"Error: '{rel}' is binary or not valid UTF-8."
+            except OSError as exc:
+                return f"Error reading '{rel}': {exc}"
+            lines = text.splitlines()
+            try:
+                start_ln = max(1, int(args.get("start_line") or 1))
+                end_ln = min(len(lines), max(start_ln, int(args.get("end_line") or (start_ln + 299))))
+            except (TypeError, ValueError):
+                return "Error: 'start_line' and 'end_line' must be integers."
+            if not lines:
+                return f"File: {rel} (empty file)"
+            numbered = [f"{idx}: {lines[idx - 1]}" for idx in range(start_ln, end_ln + 1)]
+            header = f"File: {rel} (lines {start_ln}-{end_ln} of {len(lines)})"
+            return header + "\n" + "\n".join(numbered)
+
+        if name == "write_file":
+            target, rel, err = _safe_worktree_target(wt, str(args.get("path") or ""), allowed, for_write=True)
+            if err or target is None or not rel:
+                return err or "Error: valid file path is required."
+            content = args.get("content")
+            if not isinstance(content, str):
+                return "Error: 'content' must be a string."
+            if target.is_file():
+                try:
+                    existing = target.read_bytes().decode("utf-8")
+                    if "\r\n" in existing and "\r\n" not in content:
+                        content = content.replace("\n", "\r\n")
+                except (OSError, UnicodeDecodeError):
+                    pass
+            _write_utf8_atomic(target, content)
+            return f"Wrote {len(content.splitlines())} lines to {rel}."
+
+        if name == "edit_file":
+            target, rel, err = _safe_worktree_target(wt, str(args.get("path") or ""), allowed, for_write=True)
+            if err or target is None or not rel:
+                return err or "Error: valid file path is required."
+            if not target.is_file():
+                return f"Error: file '{rel}' does not exist (use write_file to create it)."
+            old_text = args.get("old_text")
+            new_text = args.get("new_text")
+            if not isinstance(old_text, str) or not isinstance(new_text, str) or not old_text:
+                return "Error: 'old_text' (non-empty) and 'new_text' strings are required."
+            try:
+                raw_current = target.read_bytes().decode("utf-8")
+            except UnicodeDecodeError:
+                return f"Error: '{rel}' is binary or not valid UTF-8."
+            eol = "\r\n" if "\r\n" in raw_current else "\n"
+            norm_current = raw_current.replace("\r\n", "\n")
+            norm_old = old_text.replace("\r\n", "\n")
+            norm_new = new_text.replace("\r\n", "\n")
+            count = norm_current.count(norm_old)
+            if count == 0:
+                return f"Error: 'old_text' was not found in {rel}. Call read_file to inspect exact lines."
+            if count > 1:
+                return f"Error: 'old_text' matched {count} times in {rel}; include more surrounding context."
+            updated = norm_current.replace(norm_old, norm_new, 1)
+            if eol == "\r\n":
+                updated = updated.replace("\n", "\r\n")
+            _write_utf8_atomic(target, updated)
+            return f"Edited {rel} successfully."
+
+        if name == "run_tests":
+            if not test_cmd:
+                return "Error: no test command is configured for this task."
+            code, combined, timed_out = _run_test_process(test_cmd, wt, test_timeout)
+            if timed_out:
+                return f"Tests timed out after {int(test_timeout)}s."
+            if len(combined) > 6000:
+                combined = "...(truncated)...\n" + combined[-6000:]
+            return f"Exit code: {code}\n{combined}"
+
+        return f"Error: unknown tool '{name}'."
+    except Exception as exc:
+        return f"Error executing {name}: {exc}"
+
+
+KNOWN_OLLAMA_TOOLS = {"list_files", "read_file", "write_file", "edit_file", "run_tests"}
+
+
+def _extract_inline_tool_calls(content: str) -> list[dict]:
+    """Fallback when a local model emits a JSON tool call inside message.content."""
+    if not content:
+        return []
+    candidates = JSON_BLOCK.findall(content)
+    if not candidates and content.lstrip().startswith("{") and content.rstrip().endswith("}"):
+        candidates = [content.strip()]
+    calls = []
+    for raw in candidates:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+            name = fn.get("name")
+            if isinstance(name, str) and name in KNOWN_OLLAMA_TOOLS:
+                calls.append({"function": {"name": name, "arguments": fn.get("arguments", fn.get("parameters", {}))}})
+    return calls
+
+
+def run_ollama_task(brief_text: str, wt: Path, allowed: list[str], cfg: dict,
+                    timeout: int, desired_model: str | None = None) -> RunResult:
+    base_url = cfg.get("base_url") or "http://127.0.0.1:11434"
+    result = RunResult(member="ollama", ok=False)
+    start = time.time()
+    ok_conn, installed, warm, err_msg = ollama_status(base_url)
+    if not ok_conn:
+        result.notes.append(err_msg)
+        result.seconds = round(time.time() - start, 1)
+        return result
+    try:
+        model, fallback_note = select_ollama_model(desired_model, installed, warm)
+    except MemberUnavailable as exc:
+        result.notes.append(str(exc))
+        result.seconds = round(time.time() - start, 1)
+        return result
+    result.model_used = model
+    if fallback_note:
+        result.notes.append(fallback_note)
+
+    test_cmd = parse_test_command(brief_text)
+    tools = _ollama_tools(has_test_cmd=bool(test_cmd))
+    max_steps = int(cfg.get("max_steps") or 25)
+    test_timeout = float(cfg.get("test_timeout_seconds") or 120)
+    num_ctx = int(cfg.get("num_ctx") or 16384)
+    keep_alive = cfg.get("keep_alive", "30m")
+
+    user_msg = brief_text.strip()
+    if allowed:
+        user_msg += "\n\nAllowed paths: " + ", ".join(allowed)
+    if test_cmd:
+        user_msg += f"\nConfigured test command (call `run_tests` to run): `{test_cmd}`"
+    messages: list[dict] = [
+        {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    made_tool_call = False
+    try:
+        with _ollama_gpu_lock(timeout=timeout):
+            for _ in range(max_steps):
+                remaining = timeout - (time.time() - start)
+                if remaining <= 0:
+                    result.timed_out = True
+                    result.notes.append(f"Timed out after {timeout}s.")
+                    break
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                    "stream": False,
+                    "keep_alive": keep_alive,
+                    "options": {"num_ctx": num_ctx, "temperature": 0.1},
+                }
+                resp = _ollama_http(base_url, "/api/chat", payload=payload, timeout=remaining)
+                msg = resp.get("message") or {}
+                content = (msg.get("content") or "").strip()
+                tool_calls = msg.get("tool_calls") or _extract_inline_tool_calls(content)
+                messages.append(msg)
+                if not tool_calls:
+                    if not content and not made_tool_call:
+                        result.notes.append("Ollama returned an empty response without making edits.")
+                        result.exit_code = 1
+                        break
+                    result.text = content or "(completed without summary)"
+                    result.exit_code = 0
+                    result.ok = True
+                    break
+                made_tool_call = True
+                for call in tool_calls:
+                    fn = (call.get("function") or {}) if isinstance(call, dict) else {}
+                    t_name = str(fn.get("name") or "")
+                    t_args = fn.get("arguments")
+                    step_rem = max(1.0, min(test_timeout, timeout - (time.time() - start)))
+                    out = _exec_ollama_tool(t_name, t_args, wt, allowed, test_cmd, step_rem)
+                    messages.append({"role": "tool", "name": t_name, "content": out})
+            else:
+                result.notes.append(f"Reached max_steps ({max_steps}) before finishing.")
+                result.text = "(stopped at max_steps)"
+                result.exit_code = 1
+    except TimeoutError as exc:
+        result.timed_out = True
+        result.notes.append(str(exc))
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+            result.timed_out = True
+            result.notes.append(f"Timed out after {timeout}s.")
+        else:
+            result.stderr = str(exc)
+            result.notes.append(f"Ollama chat failed: {exc}")
+    result.seconds = round(time.time() - start, 1)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Verdicts & Instructions
 # ---------------------------------------------------------------------------
 VERDICTS = ("pass", "revise", "reject")
 SEVERITIES = ("blocker", "major", "minor", "nit")
@@ -455,7 +1267,7 @@ anything. Answer with these headings:
 ## Risks - what could go wrong or is easy to miss
 ## Alternatives - other approaches worth considering and why you did not pick them
 ## Open questions - what you would ask the person before starting
-## Difficulty - easy / medium / hard, and whether you would want to do this task yourself
+## Difficulty - easy / medium / hard, and which parts fit a local worker vs a frontier agent
 Be concrete and point at real code. Disagree with the brief if it is heading the wrong way.
 """
 
@@ -479,14 +1291,17 @@ SHELL_NOTE = {
     "codex": "You may run commands (tests, linters) inside the worktree; network is off.",
     "gemini": "Do not run any shell commands: they are denied in this mode and end your run. "
               "Use your file tools only; the chairman will run the tests.",
+    "claude": "Do not run any shell commands: Bash/PowerShell are disabled in restricted mode. "
+              "Use your file tools only; the chairman will run the tests.",
 }
 
 PROTECTED_GLOBS = (
-    ".git", ".git/**", "**/.git", ".github/**", ".claude/**", ".council/**", ".canto/**",
+    ".git", ".git/**", "**/.git", ".github/**", ".claude/**", ".agents/**", ".agent/**",
+    ".codex/**", ".gemini/**", ".council/**", ".canto/**",
     "**/council.config.json", "**/.gitignore", "**/.gitattributes", "**/.gitmodules",
     "**/CLAUDE.md", "**/AGENTS.md", "**/GEMINI.md", ".gitignore", "**/settings.json",
-    "**/settings.local.json", "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml",
-    "**/uv.lock", "**/poetry.lock", "**/Cargo.lock", "**/.env", "**/.env.*",
+    "**/settings.local.json", "**/hooks.json", "**/package-lock.json", "**/yarn.lock",
+    "**/pnpm-lock.yaml", "**/uv.lock", "**/poetry.lock", "**/Cargo.lock", "**/.env", "**/.env.*",
 )
 
 JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
@@ -512,7 +1327,6 @@ def parse_verdict(member: str, text: str) -> dict:
             findings.append({"severity": sev, "file": f.get("file"), "line": f.get("line"),
                              "issue": str(f.get("issue", "")), "fix": str(f.get("fix", ""))})
     verdict = data["verdict"]
-    # Consistency rule: a blocker/major finding can't coexist with "pass".
     if verdict == "pass" and any(f["severity"] in ("blocker", "major") for f in findings):
         verdict = "revise"
     try:
@@ -532,11 +1346,8 @@ def combine(verdicts: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Diff stamp (from Cantor's workspace_patch_sha256 check): a pass only counts
-# for the exact change that was reviewed.
+# Diff stamp — keep identical to policy_gate.py
 # ---------------------------------------------------------------------------
-# Keep these staged fingerprint helpers identical to policy_gate.py. Diff output
-# must retain its whitespace, and a failed git read must never become an empty diff.
 def _fingerprint_git(repo: Path, *args) -> str:
     argv = ["git", "-C", str(repo), *args]
     done = subprocess.run(argv, text=True, encoding="utf-8", errors="replace",
@@ -550,8 +1361,6 @@ def _fingerprint_head(repo: Path) -> str:
     try:
         return _fingerprint_git(repo, "rev-parse", "--verify", "HEAD").strip()
     except subprocess.CalledProcessError as exc:
-        # Only a symbolic HEAD whose ref does not exist is unborn. Repository,
-        # object and other git errors must propagate rather than use the marker.
         ref = _fingerprint_git(repo, "symbolic-ref", "--quiet", "HEAD").strip()
         if not ref.startswith("refs/heads/"):
             raise exc
@@ -588,31 +1397,108 @@ def diff_fingerprint(repo: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI commands: check, consult/ask/review, gate, task, cleanup, install
 # ---------------------------------------------------------------------------
 def cmd_check(args, config):
-    rows = []
+    clear_target = getattr(args, "clear_cooldown", None)
+    if clear_target:
+        clear_cooldown(clear_target)
+    try:
+        chairman = resolve_chairman(getattr(args, "chairman", None))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    state = load_state()
+    now = time.time()
+    member_rows = []
     for name, cfg in config["members"].items():
+        usage = usage_summary(name, state, now)
         if not cfg.get("enabled"):
-            rows.append((name, "disabled", ""))
+            member_rows.append({"name": name, "role_kind": "chairman" if name == chairman else "member",
+                                "status": "disabled", "detail": "", "usage": usage})
             continue
+        role_kind = "chairman" if name == chairman else "voting-member"
         adapter = ADAPTERS[name](cfg)
         try:
             exe = adapter.executable()
             auth = adapter.check_auth()
-            rows.append((name, "ready", f"{exe} — {auth}"))
+            status = "cooldown" if usage["cooldown_remaining_s"] > 0 else "ready"
+            detail = f"{exe} — {auth}"
+            if usage["cooldown_remaining_s"] > 0:
+                detail += f" (cooldown {usage['cooldown_remaining_s']}s)"
+            member_rows.append({"name": name, "role_kind": role_kind, "status": status,
+                                "detail": detail, "usage": usage})
         except MemberUnavailable as exc:
-            rows.append((name, "NOT READY", str(exc)))
-    for name, status, detail in rows:
-        print(f"{name:8} {status:10} {detail}")
+            member_rows.append({"name": name, "role_kind": role_kind, "status": "NOT READY",
+                                "detail": str(exc), "usage": usage})
+
+    delegate_rows = []
+    ollama_cfg = (config.get("delegates") or {}).get("ollama") or {}
+    if ollama_cfg:
+        usage = usage_summary("ollama", state, now)
+        if not ollama_cfg.get("enabled"):
+            delegate_rows.append({"name": "ollama", "role_kind": "delegate", "status": "disabled",
+                                  "detail": "", "installed_models": [], "warm_models": [], "usage": usage})
+        else:
+            base_url = ollama_cfg.get("base_url") or "http://127.0.0.1:11434"
+            ok_conn, installed, warm, err_msg = ollama_status(base_url)
+            if not ok_conn:
+                delegate_rows.append({"name": "ollama", "role_kind": "delegate", "status": "OFFLINE",
+                                      "detail": err_msg, "installed_models": [], "warm_models": [],
+                                      "usage": usage})
+            elif not installed:
+                delegate_rows.append({"name": "ollama", "role_kind": "delegate", "status": "NO MODELS",
+                                      "detail": f"{base_url} reachable, 0 models pulled",
+                                      "installed_models": [], "warm_models": [], "usage": usage})
+            else:
+                std_model, _ = resolve_tier(ollama_cfg, "standard")
+                chosen, note = select_ollama_model(std_model, installed, warm)
+                warm_str = f", warm={warm}" if warm else ""
+                fallback_str = f" ({note})" if note else ""
+                detail = f"{base_url} — active={chosen}, installed={installed}{warm_str}{fallback_str}"
+                delegate_rows.append({"name": "ollama", "role_kind": "delegate", "status": "ready",
+                                      "detail": detail, "active_model": chosen,
+                                      "installed_models": installed, "warm_models": warm, "usage": usage})
+
+    pywinpty_ok = True
     if os.name == "nt":
         try:
-            from winpty import PtyProcess  # type: ignore
+            from winpty import PtyProcess  # noqa: F401  # type: ignore
         except ImportError:
-            print("pywinpty  MISSING  (pip install pywinpty; agy may print nothing without it)")
-        else:
-            print("pywinpty  installed")
-    return 0 if all(s != "NOT READY" for _, s, _ in rows) else 1
+            pywinpty_ok = False
+
+    voting_peers = [r["name"] for r in member_rows
+                    if r["role_kind"] == "voting-member" and r["status"] in ("ready", "cooldown")]
+
+    if getattr(args, "json", False):
+        payload = {
+            "chairman": chairman,
+            "voting_members": voting_peers,
+            "members": member_rows,
+            "delegates": delegate_rows,
+            "pywinpty": pywinpty_ok if os.name == "nt" else None,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        if chairman:
+            print(f"chairman  {chairman} (voting council: {', '.join(voting_peers) or 'none'})")
+        for r in member_rows:
+            u = r["usage"]
+            tag = " [chairman]" if r["role_kind"] == "chairman" else ""
+            stats = f" [5h:{u['runs_5h']} 24h:{u['runs_24h']}]" if r["status"] != "disabled" else ""
+            print(f"{r['name']:8} {r['status']:10} {r['detail']}{stats}{tag}")
+        for r in delegate_rows:
+            u = r["usage"]
+            stats = f" [5h:{u['runs_5h']} 24h:{u['runs_24h']}]" if r["status"] != "disabled" else ""
+            print(f"{r['name']:8} {r['status']:10} [delegate] {r['detail']}{stats}")
+        if os.name == "nt":
+            print("pywinpty  installed" if pywinpty_ok else
+                  "pywinpty  MISSING  (pip install pywinpty; agy may print nothing without it)")
+
+    peer_failures = [r for r in member_rows
+                     if r["role_kind"] != "chairman" and r["status"] == "NOT READY"]
+    return 0 if not peer_failures else 1
 
 
 def cmd_run(args, config, kind: str):
@@ -620,6 +1506,19 @@ def cmd_run(args, config, kind: str):
     brief = Path(args.brief).resolve()
     out_dir = brief.parent
     workspace = Path(args.workspace).resolve() if args.workspace else Path.cwd()
+    try:
+        chairman = resolve_chairman(getattr(args, "chairman", None))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if chairman and args.member == chairman:
+        print(f"Member {args.member} is the active chairman; consult/review the other council members.",
+              file=sys.stderr)
+        return 2
+    if args.member in (config.get("delegates") or {}):
+        print(f"'{args.member}' is a non-voting delegate (worker only); it cannot {kind}.",
+              file=sys.stderr)
+        return 2
     cfg = config["members"].get(args.member)
     if cfg is None or args.member not in ADAPTERS:
         print(f"Unknown member: {args.member}", file=sys.stderr)
@@ -627,14 +1526,15 @@ def cmd_run(args, config, kind: str):
     if not cfg.get("enabled"):
         print(f"Member {args.member} is disabled in council.config.json.", file=sys.stderr)
         return 2
-    # Fingerprint the change the reviewer is given, not whatever is there when it finishes.
+
+    tier = getattr(args, "tier", None)
+    model, effort = resolve_tier(cfg, tier=tier, model=getattr(args, "model", None),
+                                 effort=getattr(args, "effort", None))
     input_fingerprint = diff_fingerprint(workspace) if review else None
     role = cfg.get("role", "")
     prompt = f"You are a council member. Your role: {role}\n\n" + brief.read_text(encoding="utf-8")
     if review:
-        # Save the staged diff where every member can read it: headless agy can't run
-        # `git diff` (shell commands are denied and end its run).
-        diff_file = out_dir / f"{args.member}.staged.diff"  # per member: parallel runs
+        diff_file = out_dir / f"{args.member}.staged.diff"
         diff_file.write_text(git(workspace, "diff", "--cached", "--binary"), encoding="utf-8")
         prompt += (f"\n\nThe staged diff under review is saved at {diff_file}. Read it there; "
                    "you can also read any file in the repository for context.\n")
@@ -645,7 +1545,11 @@ def cmd_run(args, config, kind: str):
     prompt_file.write_text(prompt, encoding="utf-8")
 
     result = run_member(args.member, prompt_file, workspace, out_dir, cfg,
-                        args.timeout or config["timeout_seconds"])
+                        args.timeout or config["timeout_seconds"],
+                        model=model, effort=effort)
+    record_usage(args.member, kind, result, tier=tier, model=result.model_used,
+                 cooldown_seconds=int(config.get("quota_cooldown_seconds", 3600)))
+
     answer_path = out_dir / f"{args.member}.md"
     answer_path.write_text(result.text or "(no answer)\n" + "\n".join(result.notes), encoding="utf-8")
     meta = {k: v for k, v in result.__dict__.items() if k != "text"}
@@ -672,16 +1576,63 @@ def cmd_run(args, config, kind: str):
     return 0 if result.ok else 1
 
 
+def _infer_task_authors(out_dir: Path, workspace: Path | None) -> set[str]:
+    records = []
+    for p in sorted(out_dir.glob("*.task.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("member"), str):
+            records.append(rec)
+    if not records:
+        return set()
+    if workspace is not None:
+        ws_norm = os.path.normcase(str(workspace.resolve()))
+        matched = {r["member"] for r in records
+                   if isinstance(r.get("worktree"), str)
+                   and os.path.normcase(str(Path(r["worktree"]).resolve())) == ws_norm}
+        if matched:
+            return matched
+    # If reviewing the merged branch in the main checkout (or no workspace given),
+    # exclude every cloud member that authored a subtask in this run directory.
+    return {r["member"] for r in records}
+
+
+def _commit_gate_enforced(repo: Path) -> bool:
+    if (repo / ".council" / "enforce-commit-gate").is_file():
+        return True
+    main = main_checkout(repo)
+    return bool(main and (main / ".council" / "enforce-commit-gate").is_file())
+
+
 def cmd_gate(args, config):
     out_dir = Path(args.dir).resolve()
-    repo = repo_root(Path(args.workspace).resolve() if args.workspace else Path.cwd())
-    # Required reviewers: --require, else every enabled member. A missing one can't pass.
-    required = ([m.strip() for m in args.require.split(",") if m.strip()] if args.require else
-                [n for n, c in config["members"].items() if c.get("enabled")])
+    ws_arg = Path(args.workspace).resolve() if getattr(args, "workspace", None) else None
+    repo = repo_root(ws_arg if ws_arg else Path.cwd())
+    try:
+        chairman = resolve_chairman(getattr(args, "chairman", None))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    raw_author = getattr(args, "author", None)
+    authors = ({a.strip() for a in raw_author.split(",") if a.strip()} if raw_author else
+               (_infer_task_authors(out_dir, ws_arg) if chairman is not None else set()))
+    excluded = ({chairman} if chairman else set()) | (authors & set(config["members"]))
+    eligible = [n for n, c in config["members"].items() if c.get("enabled") and n not in excluded]
+
+    req_arg = getattr(args, "require", None)
+    ineligible_requested: list[str] = []
+    if req_arg:
+        requested = [m.strip() for m in req_arg.split(",") if m.strip()]
+        ineligible_requested = [m for m in requested if m in excluded]
+        required = requested
+    else:
+        required = list(eligible)
+
     verdicts = []
     for path in sorted(out_dir.glob("*.verdict.json")):
         try:
-            # int rejects the decoder's non-JSON constants (NaN and +/-Infinity).
             data = json.loads(path.read_text(encoding="utf-8"), parse_constant=int)
         except (OSError, ValueError, RecursionError):
             data = None
@@ -690,31 +1641,40 @@ def cmd_gate(args, config):
         if not known_member:
             member = path.name.removesuffix(".verdict.json")
             if member not in config["members"]:
-                continue  # no identifiable member; its required review stays missing
+                continue
+        if member in excluded:
+            continue  # excluded chairman or task author can never satisfy the gate
         if (not known_member or data.get("verdict") not in (*VERDICTS, "unparseable", "unavailable")
                 or not isinstance(data.get("fingerprint"), str)
                 or not isinstance(data.get("findings", []), list)
                 or any(not isinstance(f, dict) for f in data.get("findings", []))):
             data = {"member": member, "verdict": "unparseable", "findings": []}
         verdicts.append(data)
-    if args.require:
+    if req_arg or excluded:
         verdicts = [v for v in verdicts if v["member"] in required]
     by_member = {}
     for verdict in verdicts:
         by_member.setdefault(verdict["member"], []).append(verdict)
-    missing = [m for m in required if m not in by_member]
+    missing = [m for m in required if m not in by_member or m in ineligible_requested]
     stamp = repo / ".council" / "approved.json"
     try:
         current, staged = _diff_fingerprints(repo)
     except BaseException:
-        # Can't tell what is staged: withdraw any earlier approval before failing.
         if stamp.is_file():
             stamp.unlink()
         raise
-    stale =[v["member"] for v in verdicts if v.get("fingerprint") != current]
+    stale = [v["member"] for v in verdicts if v.get("fingerprint") != current]
     decision = combine(verdicts)
-    if stale or missing:
+    if stale or missing or ineligible_requested:
         decision = "revise" if decision != "reject" else decision
+    # When commit-gate enforcement is active, a reduced --require subset cannot mint
+    # a commit approval stamp unless every eligible voting member passed.
+    enforced = _commit_gate_enforced(repo)
+    if decision == "pass" and enforced and (not eligible or any(m not in by_member for m in eligible)):
+        decision = "revise"
+        for m in eligible:
+            if m not in missing and m not in by_member:
+                missing.append(m)
     gate = {
         "decision": decision,
         "members": {m: vs[0]["verdict"] if len(vs) == 1 else combine(vs)
@@ -733,7 +1693,7 @@ def cmd_gate(args, config):
         stamp.write_text(json.dumps({"staged_fingerprint": gate["staged_fingerprint"],
                                      "source": str(out_dir / "gate.json")}, indent=2), encoding="utf-8")
     elif stamp.is_file():
-        stamp.unlink()  # a later non-pass withdraws any earlier approval
+        stamp.unlink()
     counts = {s: sum(1 for f in gate["findings"] if f.get("severity") == s) for s in SEVERITIES}
     print(f"GATE: {decision.upper()} | " + ", ".join(f"{m}={v}" for m, v in gate["members"].items())
           + f" | findings: {counts}" + (f" | stale: {stale}" if stale else "")
@@ -742,7 +1702,7 @@ def cmd_gate(args, config):
 
 
 # ---------------------------------------------------------------------------
-# Write mode: one member, one worktree, checked afterwards
+# Write mode: one worker (cloud member or local Ollama), one worktree
 # ---------------------------------------------------------------------------
 def git(repo: Path, *args, check: bool = False) -> str:
     done = subprocess.run(["git", "-C", str(repo), *args], text=True, encoding="utf-8",
@@ -773,13 +1733,17 @@ def main_checkout(workspace: Path) -> Path | None:
         return None
     common_dir = Path(common.strip()).resolve()
     if common_dir.name != ".git":
-        return None  # bare or unusual layout: don't guess
+        return None
     main = common_dir.parent
     return None if main == Path(top.strip()).resolve() else main
 
 
+def clean_slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "task"
+
+
 def run_slug(run_dir: Path) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", run_dir.name).strip("-") or "task"
+    return clean_slug(run_dir.name)
 
 
 def _sha(data: bytes) -> str:
@@ -787,8 +1751,7 @@ def _sha(data: bytes) -> str:
 
 
 def snapshot(repo: Path) -> dict:
-    """State of the main checkout that a confined member must not be able to change.
-    Content hashes, not just status labels: rewriting an already-modified file counts."""
+    """State of the main checkout that a confined worker must not be able to change."""
     untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
     hashes = []
     for rel in filter(None, untracked):
@@ -796,7 +1759,6 @@ def snapshot(repo: Path) -> dict:
             hashes.append(f"{rel}:{_sha((repo / rel).read_bytes())}")
         except OSError:
             hashes.append(f"{rel}:unreadable")
-    # Ignored files outside .council/ (e.g. .env): size and mtime, cheap enough for node_modules.
     ignored = []
     for rel in filter(None, git(repo, "ls-files", "--others", "--ignored", "--exclude-standard",
                                 "--directory", "-z").split("\0")):
@@ -814,6 +1776,21 @@ def snapshot(repo: Path) -> dict:
             meta.append(f"{f.name}:{_sha(f.read_bytes())}")
         except OSError:
             pass
+    # Hash council governance files inside .council/ so a local test process can't forge approvals.
+    gov = []
+    council_dir = repo / ".council"
+    if council_dir.is_dir():
+        gov_files = [council_dir / "approved.json", council_dir / "enforce-commit-gate"]
+        runs_dir = council_dir / "runs"
+        if runs_dir.is_dir():
+            gov_files.extend(sorted(runs_dir.rglob("gate.json")))
+            gov_files.extend(sorted(runs_dir.rglob("*.verdict.json")))
+        for gf in gov_files:
+            if gf.exists():
+                try:
+                    gov.append(f"{gf.relative_to(repo).as_posix()}:{_sha(gf.read_bytes())}")
+                except OSError:
+                    gov.append(f"{gf.name}:unreadable")
     refs = dict(r.split(" ", 1) for r in
                 git(repo, "for-each-ref", "--format=%(refname) %(objectname)").splitlines() if " " in r)
     return {
@@ -824,6 +1801,7 @@ def snapshot(repo: Path) -> dict:
         "untracked": _sha("\n".join(sorted(hashes)).encode("utf-8")),
         "ignored": _sha("\n".join(sorted(ignored)).encode("utf-8")),
         "git_config_hooks": _sha("\n".join(meta).encode("utf-8")),
+        "council_governance": _sha("\n".join(sorted(gov)).encode("utf-8")),
         "refs": refs,
         "stash": git(repo, "stash", "list"),
     }
@@ -844,7 +1822,7 @@ def glob_match(path: str, pattern: str) -> bool:
             regex, i = regex + "[^/]", i + 1
         else:
             regex, i = regex + re.escape(c), i + 1
-    flags = re.I if os.name == "nt" else 0  # Windows paths are case-insensitive
+    flags = re.I if os.name == "nt" else 0
     return re.fullmatch(regex, path, flags) is not None
 
 
@@ -856,10 +1834,31 @@ def allowed_paths(brief_text: str) -> list[str]:
     return [g.strip().strip("`") for g in re.findall(r"^\s*[-*]\s+(.+)$", m.group(1), re.M)]
 
 
+def _is_tool_cache_path(rel_path: str) -> bool:
+    parts = {p.lower() for p in rel_path.replace("\\", "/").split("/") if p}
+    return bool(parts & {d.lower() for d in TOOL_CACHE_DIRS})
+
+
+def _prune_untracked_tool_caches(wt: Path) -> None:
+    untracked = git(wt, "ls-files", "--others", "-z").split("\0")
+    for rel in filter(None, untracked):
+        if _is_tool_cache_path(rel):
+            p = wt / rel
+            with contextlib.suppress(OSError):
+                if p.is_file() or p.is_symlink():
+                    p.unlink()
+    for root, dirs, _ in os.walk(wt, topdown=False):
+        if ".git" in Path(root).parts:
+            continue
+        for d in dirs:
+            if d.lower() in {c.lower() for c in TOOL_CACHE_DIRS}:
+                dp = Path(root) / d
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(dp)
+
+
 def worktree_changes(wt: Path) -> tuple[list[str], int]:
-    """Stage everything in the worktree (the chairman reviews the staged diff) and
-    return (changed paths, changed lines). No rename detection, NUL-separated, so a
-    rename into a protected path shows up as that path."""
+    _prune_untracked_tool_caches(wt)
     git(wt, "add", "-A", check=True)
     files = [f for f in git(wt, "diff", "--cached", "--no-renames", "--name-only", "-z").split("\0") if f]
     lines = 0
@@ -871,7 +1870,7 @@ def worktree_changes(wt: Path) -> tuple[list[str], int]:
 
 def ignored_files(wt: Path) -> list[str]:
     out = git(wt, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
-    return [f for f in out.split("\0") if f]
+    return [f for f in out.split("\0") if f and not _is_tool_cache_path(f)]
 
 
 def under(path: Path, parent: Path) -> bool:
@@ -881,24 +1880,32 @@ def under(path: Path, parent: Path) -> bool:
         return False
 
 
+def _task_actor_cfg(config: dict, member: str) -> tuple[dict | None, bool]:
+    """Return (cfg, is_delegate)."""
+    if member in (config.get("delegates") or {}):
+        return config["delegates"][member], True
+    return (config.get("members") or {}).get(member), False
+
+
 def cmd_task(args, config):
     if args.member not in WRITE_MEMBERS:
         print(f"Write mode supports {', '.join(WRITE_MEMBERS)}, not {args.member}.", file=sys.stderr)
         return 2
-    cfg = config["members"].get(args.member)
+    cfg, is_delegate = _task_actor_cfg(config, args.member)
     if not cfg or not cfg.get("enabled"):
-        print(f"Member {args.member} is disabled in council.config.json.", file=sys.stderr)
+        print(f"Worker {args.member} is disabled in council.config.json.", file=sys.stderr)
         return 2
     brief = Path(args.brief).resolve()
     run_dir = brief.parent
-    repo = repo_root(Path(args.workspace).resolve() if args.workspace else Path.cwd())
+    repo = repo_root(Path(args.workspace).resolve() if getattr(args, "workspace", None) else Path.cwd())
     slug = run_slug(run_dir)
-    branch = f"council/{slug}-{args.member}"
-    wt = repo / ".council" / "worktrees" / f"{slug}-{args.member}"
+    raw_task_id = getattr(args, "task_id", None)
+    task_id = clean_slug(raw_task_id) if raw_task_id else None
+    unit = f"{task_id}-{args.member}" if task_id else args.member
+    branch = f"council/{slug}-{unit}"
+    wt = repo / ".council" / "worktrees" / f"{slug}-{unit}"
     temps = [os.environ.get(k) for k in ("TEMP", "TMP", "TMPDIR")]
     if any(t and under(wt, Path(t)) for t in temps):
-        # Codex's workspace-write sandbox also allows writes to %TEMP% (found in the
-        # canary test), so a worktree under it would not be confined.
         print("Refusing to run write mode inside a temp folder: the sandbox can't confine it.",
               file=sys.stderr)
         return 2
@@ -909,7 +1916,6 @@ def cmd_task(args, config):
         return 2
     exists = wt.exists() or bool(git(repo, "branch", "--list", branch).strip())
     if getattr(args, "resume", False):
-        # Another round on the same worktree (e.g. sending review findings back).
         listing = git(repo, "worktree", "list", "--porcelain")
         entry = next((block for block in listing.split("\n\n")
                       if block.startswith("worktree ") and Path(block.splitlines()[0][9:]).resolve() == wt.resolve()), "")
@@ -919,10 +1925,10 @@ def cmd_task(args, config):
         base = git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip()
     elif exists:
         print(f"{branch} or {wt} already exists. Pass --continue for another round, run "
-              f"`council.py cleanup --dir {run_dir}`, or use a new run folder.", file=sys.stderr)
+              f"`council.py cleanup --dir {run_dir}`, or pass --task-id <step>.", file=sys.stderr)
         return 2
     else:
-        base = args.base or git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        base = getattr(args, "base", None) or git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
         base_sha = git(repo, "rev-parse", base, check=True).strip()
         wt.parent.mkdir(parents=True, exist_ok=True)
         git(repo, "worktree", "add", "-b", branch, str(wt), base_sha, check=True)
@@ -931,30 +1937,36 @@ def cmd_task(args, config):
 
     brief_text = brief.read_text(encoding="utf-8")
     allowed = allowed_paths(brief_text)
-    prompt = (f"You are a council member doing a task. Your role: {cfg.get('role', '')}\n\n"
-              + brief_text + "\n" + WRITE_INSTRUCTIONS.format(
-                  worktree=wt, protected=", ".join(PROTECTED_GLOBS),
-                  shell_note=SHELL_NOTE[args.member]))
-    prompt_file = run_dir / f"{args.member}.task-prompt.md"
-    prompt_file.write_text(prompt, encoding="utf-8")
+    tier = getattr(args, "tier", None)
+    model, effort = resolve_tier(cfg, tier=tier, model=getattr(args, "model", None),
+                                 effort=getattr(args, "effort", None))
+    timeout = getattr(args, "timeout", None) or config["timeout_seconds"]
 
     ignored_before = set(ignored_files(wt))
     before = snapshot(repo)
-    result = run_member(args.member, prompt_file, wt, run_dir, cfg,
-                        args.timeout or config["timeout_seconds"], write=True)
+    if is_delegate and args.member == "ollama":
+        result = run_ollama_task(brief_text, wt, allowed, cfg, timeout=timeout, desired_model=model)
+    else:
+        prompt = (f"You are a council member doing a task. Your role: {cfg.get('role', '')}\n\n"
+                  + brief_text + "\n" + WRITE_INSTRUCTIONS.format(
+                      worktree=wt, protected=", ".join(PROTECTED_GLOBS),
+                      shell_note=SHELL_NOTE[args.member]))
+        prompt_file = run_dir / f"{unit}.task-prompt.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        result = run_member(args.member, prompt_file, wt, run_dir, cfg, timeout,
+                            write=True, model=model, effort=effort, unit=unit)
     after = snapshot(repo)
+    record_usage(args.member, "task", result, tier=tier, model=result.model_used,
+                 cooldown_seconds=int(config.get("quota_cooldown_seconds", 3600)))
 
     violations = [f"main checkout {key} changed during the run"
                   for key in ("head", "branch", "index", "worktree", "untracked", "ignored",
-                              "git_config_hooks", "stash")
+                              "git_config_hooks", "council_governance", "stash")
                   if before[key] != after[key]]
-    # Refs: any change, except a council/* branch created meanwhile (a parallel task).
     for ref in set(before["refs"]) | set(after["refs"]):
         if before["refs"].get(ref) != after["refs"].get(ref) and not (
                 ref not in before["refs"] and ref.startswith("refs/heads/council/")):
             violations.append(f"ref {ref} changed during the run")
-    # Check the worktree's .git pointer first: if it was rewritten, git commands in the
-    # worktree would operate on some other repository.
     now_gitfile = (wt / ".git").read_bytes() if (wt / ".git").is_file() else b"missing"
     files, lines, new_ignored = [], 0, []
     if now_gitfile != gitfile:
@@ -985,18 +1997,20 @@ def cmd_task(args, config):
         status = "DENIED"
     else:
         status = "QUOTA" if result.quota_hit else "AUTH" if result.auth_problem else "FAILED"
-    report = run_dir / f"{args.member}.md"
+    report = run_dir / f"{unit}.md"
     report.write_text(result.text or "(no report)\n" + "\n".join(result.notes), encoding="utf-8")
     record = {
-        "member": args.member, "status": status, "branch": branch, "worktree": str(wt),
-        "base": base, "start_sha": start_sha, "files": files, "lines_changed": lines,
-        "new_ignored_files": new_ignored, "allowed_paths": allowed, "violations": violations,
+        "member": args.member, "task_id": task_id, "status": status, "branch": branch,
+        "worktree": str(wt), "base": base, "start_sha": start_sha, "files": files,
+        "lines_changed": lines, "new_ignored_files": new_ignored, "allowed_paths": allowed,
+        "violations": violations,
         "staged_fingerprint": staged_fingerprint(wt) if now_gitfile == gitfile else None,
+        "tier": tier, "model": result.model_used, "effort": result.effort_used,
         "seconds": result.seconds, "notes": result.notes, "stderr": result.stderr[-2000:],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    (run_dir / f"{args.member}.task.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
-    line = (f"{args.member}: {status} in {result.seconds}s | {len(files)} files, {lines} lines "
+    (run_dir / f"{unit}.task.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    line = (f"{unit}: {status} in {result.seconds}s | {len(files)} files, {lines} lines "
             f"| worktree {wt} | branch {branch} | report {report}")
     if violations:
         line += " | VIOLATIONS: " + "; ".join(violations)
@@ -1007,22 +2021,42 @@ def cmd_task(args, config):
 
 
 def cmd_cleanup(args, config):
-    """Remove the worktrees and council/* branches a task run created. Only touches
-    paths under .council/worktrees/ and branches named council/<run>-<member>, and
-    keeps anything that would lose work unless --discard is given."""
+    """Remove worktrees and council/* branches a task run created."""
     run_dir = Path(args.dir).resolve()
-    repo = repo_root(Path(args.workspace).resolve() if args.workspace else Path.cwd())
-    members = [args.member] if args.member else list(WRITE_MEMBERS)
+    repo = repo_root(Path(args.workspace).resolve() if getattr(args, "workspace", None) else Path.cwd())
     slug = run_slug(run_dir)
     root = repo / ".council" / "worktrees"
-    for member in members:
-        wt = root / f"{slug}-{member}"
-        branch = f"council/{slug}-{member}"
+    raw_task_id = getattr(args, "task_id", None)
+    task_id = clean_slug(raw_task_id) if raw_task_id else None
+    member_arg = getattr(args, "member", None)
+
+    units: list[str] = []
+    if member_arg and task_id:
+        units.append(f"{task_id}-{member_arg}")
+    elif member_arg:
+        units.append(member_arg)
+        for p in sorted(run_dir.glob(f"*-{member_arg}.task.json")):
+            u = p.name.removesuffix(".task.json")
+            if u not in units:
+                units.append(u)
+    elif task_id:
+        for m in WRITE_MEMBERS:
+            units.append(f"{task_id}-{m}")
+    else:
+        units.extend(WRITE_MEMBERS)
+        for p in sorted(run_dir.glob("*.task.json")):
+            u = p.name.removesuffix(".task.json")
+            if u not in units:
+                units.append(u)
+
+    for unit in units:
+        wt = root / f"{slug}-{unit}"
+        branch = f"council/{slug}-{unit}"
         if not under(wt, root):
             print(f"refusing: {wt} is not under {root}", file=sys.stderr)
             return 2
         if wt.exists():
-            ok, status = git_ok(wt, "status", "--porcelain")  # ignored build output isn't work
+            ok, status = git_ok(wt, "status", "--porcelain")
             head_ok, head = git_ok(wt, "rev-parse", "HEAD")
             tip_ok, tip = git_ok(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
             protected = tip_ok and tip.strip() == head.strip() or (
@@ -1046,36 +2080,199 @@ def cmd_cleanup(args, config):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Cross-CLI Installer (links Claude, Antigravity/agy, and Codex to SKILL_ROOT)
+# ---------------------------------------------------------------------------
+def _link_skill_dir(dst: Path, src: Path, force: bool = False) -> str:
+    src_resolved = src.resolve()
+    if dst.exists() or dst.is_symlink():
+        try:
+            if dst.resolve() == src_resolved:
+                return f"already linked -> {src_resolved}"
+        except OSError:
+            pass
+        if not force:
+            return f"SKIPPED (exists at {dst}; pass --force to replace)"
+        if dst.is_symlink() or (os.name == "nt" and dst.is_dir()):
+            if os.name == "nt" and not dst.is_symlink():
+                # Windows directory junction: `rmdir` removes the junction without deleting target files
+                done = subprocess.run(["cmd", "/c", "rmdir", str(dst)], capture_output=True, text=True)
+                if done.returncode != 0:
+                    shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        elif dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src_resolved)],
+                              capture_output=True, text=True)
+        if done.returncode != 0:
+            raise RuntimeError(f"mklink /J failed for {dst}: {done.stderr.strip() or done.stdout.strip()}")
+        return f"junction created -> {src_resolved}"
+    dst.symlink_to(src_resolved, target_is_directory=True)
+    return f"symlink created -> {src_resolved}"
+
+
+AGY_HOOK_MATCHER = (
+    "run_command|edit_file|write_file|multi_edit|"
+    "write_to_file|replace_file_content|multi_replace_file_content|"
+    "read_file|view_file"
+)
+
+
+def _load_json_dict_strict(path: Path) -> tuple[dict | None, str | None]:
+    if not path.is_file():
+        return {}, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        return None, f"refusing to modify {path}: invalid JSON ({exc})"
+    if not isinstance(data, dict):
+        return None, f"refusing to modify {path}: top-level JSON must be an object"
+    return data, None
+
+
+def _install_hooks(home: Path, skill_root: Path) -> tuple[list[str], bool]:
+    notes = []
+    ok = True
+    gate_script = (skill_root / "scripts" / "policy_gate.py").resolve().as_posix()
+    py_cmd = "python" if os.name == "nt" else "python3"
+    cmd_str = f'{py_cmd} "{gate_script}"'
+
+    # 1. Claude Code (~/.claude/settings.json)
+    claude_settings = home / ".claude" / "settings.json"
+    data, err = _load_json_dict_strict(claude_settings)
+    if err or data is None:
+        notes.append(f"claude hook   FAILED ({err})")
+        ok = False
+    else:
+        hooks_obj = data.get("hooks")
+        if hooks_obj is not None and not isinstance(hooks_obj, dict):
+            notes.append(f"claude hook   FAILED (refusing to modify {claude_settings}: 'hooks' is not an object)")
+            ok = False
+        else:
+            hooks_dict = data.setdefault("hooks", {})
+            pre = hooks_dict.get("PreToolUse")
+            if pre is not None and not isinstance(pre, list):
+                notes.append(f"claude hook   FAILED (refusing to modify {claude_settings}: 'PreToolUse' is not a list)")
+                ok = False
+            else:
+                pre_list = hooks_dict.setdefault("PreToolUse", [])
+                matcher = "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read"
+                if not any("policy_gate.py" in json.dumps(entry) for entry in pre_list):
+                    pre_list.append({"matcher": matcher, "hooks": [{"type": "command", "command": cmd_str}]})
+                    _write_utf8_atomic(claude_settings, json.dumps(data, indent=2) + "\n")
+                    notes.append(f"claude hook   installed in {claude_settings}")
+                else:
+                    notes.append(f"claude hook   already present in {claude_settings}")
+
+    # 2. Antigravity / agy (~/.gemini/config/hooks.json)
+    agy_hooks = home / ".gemini" / "config" / "hooks.json"
+    hdata, herr = _load_json_dict_strict(agy_hooks)
+    if herr or hdata is None:
+        notes.append(f"agy hook      FAILED ({herr})")
+        ok = False
+    else:
+        hdata["council-policy-gate"] = {
+            "enabled": True,
+            "PreToolUse": [
+                {
+                    "matcher": AGY_HOOK_MATCHER,
+                    "hooks": [{"type": "command", "command": cmd_str, "timeout": 20}],
+                }
+            ],
+        }
+        _write_utf8_atomic(agy_hooks, json.dumps(hdata, indent=2) + "\n")
+        notes.append(f"agy hook      configured in {agy_hooks}")
+    return notes, ok
+
+
+def cmd_install(args, config):
+    home = Path(getattr(args, "home", None) or Path.home()).resolve()
+    targets = [
+        ("gemini (agy)", home / ".gemini" / "config" / "skills" / "council"),
+        ("claude", home / ".claude" / "skills" / "council"),
+        ("codex", home / ".agents" / "skills" / "council"),
+    ]
+    code = 0
+    for label, dst in targets:
+        try:
+            status = _link_skill_dir(dst, SKILL_ROOT, force=bool(getattr(args, "force", False)))
+            if status.startswith("SKIPPED"):
+                code = 1
+        except RuntimeError as exc:
+            status = f"FAILED ({exc})"
+            code = 1
+        print(f"{label:14} {dst} -> {status}")
+    if getattr(args, "with_hooks", False):
+        notes, hooks_ok = _install_hooks(home, SKILL_ROOT)
+        for note in notes:
+            print(note)
+        if not hooks_ok:
+            code = 1
+    return code
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="Council member runner")
+    parser = argparse.ArgumentParser(description="Council member & local worker runner")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("check")
+
+    chk = sub.add_parser("check")
+    chk.add_argument("--chairman", help="active chairman CLI (claude, codex, gemini/agy, or auto)")
+    chk.add_argument("--json", action="store_true", help="output machine-readable status & usage JSON")
+    chk.add_argument("--clear-cooldown", help="clear quota cooldown for a member or 'all'")
+
     for name in ("ask", "consult", "review"):
         p = sub.add_parser(name)
         p.add_argument("--member", required=True)
         p.add_argument("--brief", required=True)
         p.add_argument("--workspace")
+        p.add_argument("--chairman", help="active chairman CLI (prevents self-consulting)")
+        p.add_argument("--tier", choices=TIERS, help="semantic model/effort preset")
+        p.add_argument("--model", help="explicit model override")
+        p.add_argument("--effort", help="explicit reasoning effort override")
         p.add_argument("--timeout", type=int)
+
     g = sub.add_parser("gate")
     g.add_argument("--dir", required=True)
     g.add_argument("--workspace")
+    g.add_argument("--chairman", help="exclude active chairman from required headless reviewers")
+    g.add_argument("--author", help="exclude task author from reviewing its own work")
     g.add_argument("--require", help="comma-separated reviewers that must have a verdict "
-                                     "(default: every enabled member)")
+                                     "(default: enabled voting members minus chairman & author)")
+
     t = sub.add_parser("task")
-    t.add_argument("--member", required=True)
+    t.add_argument("--member", required=True, help="worker to run (ollama, codex, claude, or gemini)")
     t.add_argument("--brief", required=True)
+    t.add_argument("--task-id", help="optional sub-task slug for multi-task runs in one run folder")
     t.add_argument("--base", help="branch or commit to start from (default: current branch)")
     t.add_argument("--workspace", help="repo to work in (default: current directory)")
+    t.add_argument("--tier", choices=TIERS, help="semantic model/effort preset")
+    t.add_argument("--model", help="explicit model override")
+    t.add_argument("--effort", help="explicit reasoning effort override")
     t.add_argument("--timeout", type=int)
     t.add_argument("--continue", dest="resume", action="store_true",
                    help="another round in the existing worktree (e.g. with review findings)")
+
     c = sub.add_parser("cleanup")
     c.add_argument("--dir", required=True)
     c.add_argument("--member", choices=WRITE_MEMBERS)
+    c.add_argument("--task-id", help="optional sub-task slug")
     c.add_argument("--workspace")
     c.add_argument("--discard", action="store_true", help="also delete unmerged council branches")
+
+    inst = sub.add_parser("install")
+    inst.add_argument("--with-hooks", action="store_true",
+                      help="also configure policy_gate.py in Claude and Antigravity hooks")
+    inst.add_argument("--force", action="store_true",
+                      help="replace existing skill directories at destination paths")
+    inst.add_argument("--home", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
     config = load_config()
     if args.cmd == "check":
@@ -1086,6 +2283,8 @@ def main() -> int:
         return cmd_task(args, config)
     if args.cmd == "cleanup":
         return cmd_cleanup(args, config)
+    if args.cmd == "install":
+        return cmd_install(args, config)
     return cmd_gate(args, config)
 
 

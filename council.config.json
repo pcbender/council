@@ -1,26 +1,58 @@
 {
   "timeout_seconds": 900,
+  "quota_cooldown_seconds": 3600,
   "members": {
     "codex": {
       "enabled": true,
       "executable": "codex",
       "model": null,
       "extra_args": [],
-      "role": "Adversarial code reviewer: correctness, edge cases, bugs, security."
+      "tiers": {
+        "fast": { "model": null, "effort": "low" },
+        "standard": { "model": null, "effort": "medium" },
+        "deep": { "model": null, "effort": "high" }
+      },
+      "role": "Adversarial code reviewer: correctness, edge cases, concurrency, bugs, security."
     },
     "gemini": {
       "enabled": true,
       "executable": "agy",
       "model": null,
       "extra_args": [],
+      "tiers": {
+        "fast": { "model": null, "effort": "low" },
+        "standard": { "model": null, "effort": "medium" },
+        "deep": { "model": null, "effort": "high" }
+      },
       "role": "Whole-repo critic: architecture, consistency with the rest of the codebase, what was missed."
     },
     "claude": {
-      "enabled": false,
+      "enabled": true,
       "executable": "claude",
       "model": null,
       "extra_args": [],
-      "role": "Fresh-context second opinion (useful when the chairman is not Claude)."
+      "tiers": {
+        "fast": { "model": "sonnet", "effort": "low" },
+        "standard": { "model": "sonnet", "effort": "medium" },
+        "deep": { "model": "opus", "effort": "high" }
+      },
+      "role": "Pragmatic implementer & API reviewer: design clarity, maintainability, failure handling."
+    }
+  },
+  "delegates": {
+    "ollama": {
+      "enabled": true,
+      "base_url": "http://127.0.0.1:11434",
+      "keep_alive": "30m",
+      "num_ctx": 16384,
+      "max_steps": 25,
+      "test_timeout_seconds": 120,
+      "tiers": {
+        "fast": { "model": "qwen2.5-coder:14b" },
+        "standard": { "model": "qwen2.5-coder:14b" },
+        "deep": { "model": "qwen3-coder:30b-a3b" }
+      },
+      "role": "Local implementation worker: execute bounded file edits and iterate against tests."
     }
   }
 }
