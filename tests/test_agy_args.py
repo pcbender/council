@@ -41,7 +41,8 @@ class AgyReadDirsTest(unittest.TestCase):
 
     def dirs(self, workspace):
         argv, _ = self.adapter.build(self.prompt, workspace, self.prompt.parent / "out.md")
-        self.assertEqual(argv[-2:], ["--mode", "plan"])
+        self.assertEqual(argv[-2:], ["--sandbox", "--disable-slash-commands"])
+        self.assertNotIn("--mode", argv)
         return [Path(argv[i + 1]).resolve() for i, a in enumerate(argv) if a == "--add-dir"]
 
     def test_worktree_adds_main_checkout(self):

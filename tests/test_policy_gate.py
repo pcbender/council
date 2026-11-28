@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import policy_gate  # noqa: E402
@@ -43,6 +44,17 @@ class PolicyGateTest(unittest.TestCase):
         hit = policy_gate.evaluate({"tool_name": "Edit", "cwd": str(self.repo),
                                     "tool_input": {"file_path": path}})
         return hit[0] if hit else "allow"
+
+    def test_user_installation_is_governance_but_repo_run_notes_are_not(self):
+        home = self.repo.parent / "home"
+        with patch.object(Path, "home", return_value=home):
+            for relative in (".council", ".council/app/scripts/council.py", ".council/app.previous/VERSION",
+                             ".council/INSTALL.JSON"):
+                self.assertEqual(self.edit(str(home / relative)), "ask")
+            self.assertEqual(self.edit(".council/runs/current/brief.md"), "allow")
+            self.assertEqual(self.bash('python "~/.council/app/scripts/council.py" update'), "ask")
+            self.assertEqual(self.bash('py -3 "~/.council/app/scripts/council.py" uninstall'), "ask")
+            self.assertEqual(self.bash('"~/.council/app/scripts/council.py" install'), "ask")
 
     # Tier 0 / 1: allowed silently
     def test_tier0_and_tier1_allowed(self):

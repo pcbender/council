@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -34,6 +35,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import council_install
 
 HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
@@ -97,7 +100,7 @@ DEFAULT_CONFIG = {
                 "standard": {"model": None, "effort": "medium"},
                 "deep": {"model": None, "effort": "high"},
             },
-            "role": "Whole-repo critic: architecture, consistency, what was missed.",
+            "role": "Whole-repo critic: architecture, consistency with the rest of the codebase, what was missed.",
         },
         "claude": {
             "enabled": True, "executable": "claude", "model": None, "extra_args": [],
@@ -106,7 +109,7 @@ DEFAULT_CONFIG = {
                 "standard": {"model": "sonnet", "effort": "medium"},
                 "deep": {"model": "opus", "effort": "high"},
             },
-            "role": "Pragmatic implementer & API reviewer: clarity, maintainability, failure handling.",
+            "role": "Pragmatic implementer & API reviewer: design clarity, maintainability, failure handling.",
         },
     },
     "delegates": {
@@ -144,10 +147,19 @@ def _merge_actor_group(dst: dict, src: dict) -> None:
                     dst_tiers.setdefault(t_name, {}).update(t_vals)
 
 
-def load_config() -> dict:
+def load_config(home: Path | None = None) -> dict:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
-    if CONFIG_PATH.is_file():
-        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    for path in (CONFIG_PATH, (home or Path.home()) / ".council/council.config.json"):
+        if not path.is_file():
+            continue
+        try:
+            user = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(user, dict) or any(
+                user.get(name) is not None and not isinstance(user[name], dict) for name in ("members", "delegates")
+            ):
+                raise ValueError("configuration, members and delegates must be objects")
+        except ValueError as exc:
+            raise ValueError(f"Invalid Council configuration in {path}: {exc}") from exc
         for scalar in ("timeout_seconds", "quota_cooldown_seconds"):
             if scalar in user:
                 config[scalar] = user[scalar]
@@ -213,11 +225,13 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 @contextlib.contextmanager
-def _file_lock(lock_path: Path, timeout: float = 10.0):
+def _file_lock(lock_path: Path, timeout: float = 10.0, *, required: bool = False):
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(lock_path, "a+b")
     except OSError:
+        if required:
+            raise
         yield
         return
     start = time.time()
@@ -530,19 +544,24 @@ class GeminiAgyAdapter(Adapter):
                     f"Task prompt is {len(prompt)} chars; agy write mode passes it inline "
                     f"(limit {MAX_INLINE_PROMPT}). Shorten the brief and point at files.")
             argv = [self.executable(), "--print", prompt, "--add-dir", str(workspace),
-                    "--mode", "accept-edits", "--sandbox"]
+                    "--mode", "accept-edits", "--sandbox", "--disable-slash-commands"]
         else:
+            # Note: Do NOT pass `--mode plan` on agy 1.5.19+: plan mode triggers the
+            # interactive /plan workflow and writes an implementation_plan.md artifact
+            # instead of replying on stdout. Default headless `--print` with `--sandbox`
+            # auto-denies all file writes and shell commands while answering on stdout.
             instruction = (
                 f"Read the file at {prompt_file} and do exactly what it asks. "
-                "Do not modify any files. Do not run shell commands: in this mode they are "
-                "denied and end your run, so use your file-reading tools only. "
-                "Reply with your answer only."
+                "Do not modify any files and do not create artifact/plan files — write your "
+                "complete response directly in your reply text only. Do not run shell commands: "
+                "in this mode they are denied and end your run, so use your file-reading tools only."
             )
             argv = [self.executable(), "--print", instruction, "--add-dir", str(workspace),
-                    "--add-dir", str(prompt_file.parent), "--mode", "plan"]
+                    "--add-dir", str(prompt_file.parent)]
             main = main_checkout(workspace)
             if main is not None:
-                argv[-2:-2] = ["--add-dir", str(main)]
+                argv += ["--add-dir", str(main)]
+            argv += ["--sandbox", "--disable-slash-commands"]
         chosen_model = model if model is not None else self.cfg.get("model")
         if chosen_model:
             argv += ["--model", chosen_model]
@@ -562,7 +581,8 @@ AGY_DENIED = re.compile(r"no output produced.*?required the \"(\w+)\" permission
 # Cloud CLI execution, with the agy non-TTY workaround
 # ---------------------------------------------------------------------------
 def _run_plain(argv, stdin_text, cwd, timeout):
-    return subprocess.run(argv, input=stdin_text, cwd=cwd, text=True, encoding="utf-8",
+    io_kw = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+    return subprocess.run(argv, **io_kw, cwd=cwd, text=True, encoding="utf-8",
                           errors="replace", capture_output=True, timeout=timeout,
                           env=scrubbed_env(), check=False)
 
@@ -974,9 +994,20 @@ def _run_test_process(test_cmd: str, wt: Path, timeout_s: float) -> tuple[int, s
         return -1, "", True
 
 
-def _write_utf8_atomic(target: Path, text: str) -> None:
+def _write_utf8_atomic(target: Path, text: str, *, preserve_mode: bool = False) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    if preserve_mode and os.name != "nt":
+        mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+            tmp.chmod(mode)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(text)
     os.replace(tmp, target)
@@ -1508,9 +1539,18 @@ def cmd_check(args, config):
             print("pywinpty  installed" if pywinpty_ok else
                   "pywinpty  MISSING  (pip install pywinpty; agy may print nothing without it)")
 
-    peer_failures = [r for r in member_rows
-                     if r["role_kind"] != "chairman" and r["status"] == "NOT READY"]
-    return 0 if not peer_failures else 1
+    ready_peers = [r for r in member_rows if r["role_kind"] == "voting-member" and r["status"] == "ready"]
+    if chairman is None:
+        if len(ready_peers) < 2 and not getattr(args, "json", False):
+            print("Council needs two ready CLIs. Use --chairman to check a specific host.")
+        return 0 if len(ready_peers) >= 2 else 1
+    chair_ready = any(r["role_kind"] == "chairman" and r["status"] in ("ready", "cooldown") for r in member_rows)
+    if not getattr(args, "json", False):
+        if not chair_ready:
+            print(f"Chairman {chairman} is unavailable.")
+        if not ready_peers:
+            print("No voting peer is ready.")
+    return 0 if chair_ready and ready_peers else 1
 
 
 def cmd_run(args, config, kind: str):
@@ -2092,142 +2132,6 @@ def cmd_cleanup(args, config):
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Cross-CLI Installer (links Claude, Antigravity/agy, and Codex to SKILL_ROOT)
-# ---------------------------------------------------------------------------
-def _link_skill_dir(dst: Path, src: Path, force: bool = False) -> str:
-    src_resolved = src.resolve()
-    if dst.exists() or dst.is_symlink():
-        try:
-            if dst.resolve() == src_resolved:
-                return f"already linked -> {src_resolved}"
-        except OSError:
-            pass
-        if not force:
-            return f"SKIPPED (exists at {dst}; pass --force to replace)"
-        if dst.is_symlink() or (os.name == "nt" and dst.is_dir()):
-            if os.name == "nt" and not dst.is_symlink():
-                # Windows directory junction: `rmdir` removes the junction without deleting target files
-                done = subprocess.run(["cmd", "/c", "rmdir", str(dst)], capture_output=True, text=True)
-                if done.returncode != 0:
-                    shutil.rmtree(dst)
-            else:
-                dst.unlink()
-        elif dst.is_dir():
-            shutil.rmtree(dst)
-        else:
-            dst.unlink()
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src_resolved)],
-                              capture_output=True, text=True)
-        if done.returncode != 0:
-            raise RuntimeError(f"mklink /J failed for {dst}: {done.stderr.strip() or done.stdout.strip()}")
-        return f"junction created -> {src_resolved}"
-    dst.symlink_to(src_resolved, target_is_directory=True)
-    return f"symlink created -> {src_resolved}"
-
-
-AGY_HOOK_MATCHER = (
-    "run_command|edit_file|write_file|multi_edit|"
-    "write_to_file|replace_file_content|multi_replace_file_content|"
-    "read_file|view_file"
-)
-
-
-def _load_json_dict_strict(path: Path) -> tuple[dict | None, str | None]:
-    if not path.is_file():
-        return {}, None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError) as exc:
-        return None, f"refusing to modify {path}: invalid JSON ({exc})"
-    if not isinstance(data, dict):
-        return None, f"refusing to modify {path}: top-level JSON must be an object"
-    return data, None
-
-
-def _install_hooks(home: Path, skill_root: Path) -> tuple[list[str], bool]:
-    notes = []
-    ok = True
-    gate_script = (skill_root / "scripts" / "policy_gate.py").resolve().as_posix()
-    py_cmd = "python" if os.name == "nt" else "python3"
-    cmd_str = f'{py_cmd} "{gate_script}"'
-
-    # 1. Claude Code (~/.claude/settings.json)
-    claude_settings = home / ".claude" / "settings.json"
-    data, err = _load_json_dict_strict(claude_settings)
-    if err or data is None:
-        notes.append(f"claude hook   FAILED ({err})")
-        ok = False
-    else:
-        hooks_obj = data.get("hooks")
-        if hooks_obj is not None and not isinstance(hooks_obj, dict):
-            notes.append(f"claude hook   FAILED (refusing to modify {claude_settings}: 'hooks' is not an object)")
-            ok = False
-        else:
-            hooks_dict = data.setdefault("hooks", {})
-            pre = hooks_dict.get("PreToolUse")
-            if pre is not None and not isinstance(pre, list):
-                notes.append(f"claude hook   FAILED (refusing to modify {claude_settings}: 'PreToolUse' is not a list)")
-                ok = False
-            else:
-                pre_list = hooks_dict.setdefault("PreToolUse", [])
-                matcher = "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read"
-                if not any("policy_gate.py" in json.dumps(entry) for entry in pre_list):
-                    pre_list.append({"matcher": matcher, "hooks": [{"type": "command", "command": cmd_str}]})
-                    _write_utf8_atomic(claude_settings, json.dumps(data, indent=2) + "\n")
-                    notes.append(f"claude hook   installed in {claude_settings}")
-                else:
-                    notes.append(f"claude hook   already present in {claude_settings}")
-
-    # 2. Antigravity / agy (~/.gemini/config/hooks.json)
-    agy_hooks = home / ".gemini" / "config" / "hooks.json"
-    hdata, herr = _load_json_dict_strict(agy_hooks)
-    if herr or hdata is None:
-        notes.append(f"agy hook      FAILED ({herr})")
-        ok = False
-    else:
-        hdata["council-policy-gate"] = {
-            "enabled": True,
-            "PreToolUse": [
-                {
-                    "matcher": AGY_HOOK_MATCHER,
-                    "hooks": [{"type": "command", "command": cmd_str, "timeout": 20}],
-                }
-            ],
-        }
-        _write_utf8_atomic(agy_hooks, json.dumps(hdata, indent=2) + "\n")
-        notes.append(f"agy hook      configured in {agy_hooks}")
-    return notes, ok
-
-
-def cmd_install(args, config):
-    home = Path(getattr(args, "home", None) or Path.home()).resolve()
-    targets = [
-        ("gemini (agy)", home / ".gemini" / "config" / "skills" / "council"),
-        ("claude", home / ".claude" / "skills" / "council"),
-        ("codex", home / ".agents" / "skills" / "council"),
-    ]
-    code = 0
-    for label, dst in targets:
-        try:
-            status = _link_skill_dir(dst, SKILL_ROOT, force=bool(getattr(args, "force", False)))
-            if status.startswith("SKIPPED"):
-                code = 1
-        except RuntimeError as exc:
-            status = f"FAILED ({exc})"
-            code = 1
-        print(f"{label:14} {dst} -> {status}")
-    if getattr(args, "with_hooks", False):
-        notes, hooks_ok = _install_hooks(home, SKILL_ROOT)
-        for note in notes:
-            print(note)
-        if not hooks_ok:
-            code = 1
-    return code
-
-
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -2278,15 +2182,16 @@ def main() -> int:
     c.add_argument("--workspace")
     c.add_argument("--discard", action="store_true", help="also delete unmerged council branches")
 
-    inst = sub.add_parser("install")
-    inst.add_argument("--with-hooks", action="store_true",
-                      help="also configure policy_gate.py in Claude and Antigravity hooks")
-    inst.add_argument("--force", action="store_true",
-                      help="replace existing skill directories at destination paths")
-    inst.add_argument("--home", help=argparse.SUPPRESS)
+    council_install.add_commands(sub)
 
     args = parser.parse_args()
-    config = load_config()
+    if args.cmd in ("install", "update", "uninstall", "build-release"):
+        return council_install.run(args, SKILL_ROOT, _file_lock, _write_utf8_atomic, DEFAULT_CONFIG)
+    try:
+        config = load_config()
+    except (OSError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 2
     if args.cmd == "check":
         return cmd_check(args, config)
     if args.cmd in ("ask", "consult", "review"):
@@ -2295,8 +2200,6 @@ def main() -> int:
         return cmd_task(args, config)
     if args.cmd == "cleanup":
         return cmd_cleanup(args, config)
-    if args.cmd == "install":
-        return cmd_install(args, config)
     return cmd_gate(args, config)
 
 

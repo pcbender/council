@@ -11,18 +11,26 @@ All orchestration goes through `scripts/council.py`. Keep what you show the user
 
 `SKILL_DIR` below means the folder containing this `SKILL.md`, `CHAIR` means your identity (`gemini`, `claude`, or `codex`), and `python` means Python 3 (`python` on Windows, often `python3` on macOS/Linux). Run folders live in `.council/runs/<yyyymmdd-hhmm>-<short-slug>/` in the repo root (`.council/` must be in `.gitignore`; `task` refuses to run otherwise).
 
-> **Antigravity (`agy`) sandbox rule:** When you are chairing from `agy`, its default command sandbox blocks localhost (`127.0.0.1:11434` for Ollama), network access for cloud CLIs, and `.git` ref updates. Always invoke `council.py` and git branch/worktree/merge commands with `BypassSandbox: true`.
+> **Chairman sandbox & timeout rules:**
+> - **Antigravity (`agy`)**: Its default command sandbox blocks localhost (`127.0.0.1:11434` for Ollama), network access for cloud CLIs, and `.git` ref updates. Always invoke `council.py` and git branch/worktree/merge commands with `BypassSandbox: true`.
+> - **Codex (`codex`)**: Its default `workspace-write` sandbox disables network and blocks peer CLIs (`agy`, `claude`) from reading their user-profile auth tokens. Request unsandboxed/escalated execution when running `council.py`, and leave `--timeout` at the config default (`900s`, or at least `300s`) rather than passing short timeouts like `150s` on multi-file consults/reviews.
 
 Members load the repo's `AGENTS.md` natively, so don't paste repo conventions into briefs: write only what is specific to this run.
 
-## Modes
+## Modes & Invocation
 
-- `/council check` — Run `python "SKILL_DIR/scripts/council.py" check --chairman CHAIR`; report which voting members and local Ollama models are ready, warm in VRAM, or in quota cooldown.
-- `/council approach <problem>` — **Consult & plan**: convene the 2 voting council members, synthesize the best approach + worker/tier assignments, and **wait for the user's go-ahead**.
-- `/council implement <problem>` (or when the user says "go ahead" after `/council approach`) — **End-to-end**: run consult (if not already done), execute the adaptive task plan across workers, cross-review, and merge passing branches into your work branch.
-- `/council <question>` — **Ask**: open deliberation on an architectural or design question.
-- `/council task <what to do>` — **Direct task**: skip deliberation when the spec is already clear and dispatch straight to a worker worktree.
-- `/council review` — **Review**: structured verdicts from both voting council members on the staged diff, followed by `gate`.
+Trigger syntax varies slightly by CLI:
+- **Claude Code (`claude`)**: `/council <mode> ...`
+- **Codex (`codex`)**: `$council <mode> ...` (use `$` in Codex — `/` is reserved for built-in TUI commands like `/skills`)
+- **Antigravity (`agy`)**: `council <mode> ...` (plain prompt without `/`, since `/` is reserved for built-in UI commands)
+
+Modes:
+- `council check` — Run `python "SKILL_DIR/scripts/council.py" check --chairman CHAIR`; report which voting members and local Ollama models are ready, warm in VRAM, or in quota cooldown.
+- `council approach <problem>` — **Consult & plan**: convene the 2 voting council members, synthesize the best approach + worker/tier assignments, and **wait for the user's go-ahead**.
+- `council implement <problem>` (or when the user says "go ahead" after `approach`) — **End-to-end**: run consult (if not already done), execute the adaptive task plan across workers, cross-review, and merge passing branches into your work branch.
+- `council <question>` — **Ask**: open deliberation on an architectural or design question.
+- `council task <what to do>` — **Direct task**: skip deliberation when the spec is already clear and dispatch straight to a worker worktree.
+- `council review` — **Review**: structured verdicts from both voting council members on the staged diff, followed by `gate`.
 
 ## 1. Consult mode (`approach` / `ask`)
 
