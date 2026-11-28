@@ -1179,6 +1179,7 @@ def run_ollama_task(brief_text: str, wt: Path, allowed: list[str], cfg: dict,
     ]
 
     made_tool_call = False
+    nudges = 0
     try:
         with _ollama_gpu_lock(timeout=timeout):
             for _ in range(max_steps):
@@ -1205,6 +1206,17 @@ def run_ollama_task(brief_text: str, wt: Path, allowed: list[str], cfg: dict,
                         result.notes.append("Ollama returned an empty response without making edits.")
                         result.exit_code = 1
                         break
+                    if "## changed" not in content.lower() and nudges < 2:
+                        nudges += 1
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You did not emit a tool call or final report. If more edits or `run_tests` "
+                                "are needed, emit the tool call now; if everything is complete and tested, "
+                                "reply with `## Changed`, `## Tested`, and `## Unsure`."
+                            ),
+                        })
+                        continue
                     result.text = content or "(completed without summary)"
                     result.exit_code = 0
                     result.ok = True
