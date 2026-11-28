@@ -631,6 +631,32 @@ def agy_decision(hit: tuple[str, str] | None) -> dict:
     return {"decision": "force_ask" if kind == "ask" else "deny", "reason": reason}
 
 
+AGY_PATH_KEYS = ("Path", "TargetFile", "AbsolutePath", "file_path", "path")
+AGY_WRITE_TOOLS = ("edit_file", "write_file", "multi_edit",
+                   "write_to_file", "replace_file_content", "multi_replace_file_content")
+AGY_READ_TOOLS = ("read_file", "view_file")
+
+
+def _agy_extract_paths(args: dict, tool_name: str) -> tuple[list[str] | None, tuple[str, str] | None]:
+    present = [args[k] for k in AGY_PATH_KEYS if k in args and args[k] is not None]
+    if not present:
+        return None, ("ask", f"{tool_name} has no recognised target path; the user approves (Tier 2).")
+    paths: list[str] = []
+    for val in present:
+        if not isinstance(val, str) or not val.strip():
+            return None, ("ask", f"{tool_name} has a malformed or empty target path; the user approves (Tier 2).")
+        paths.append(val)
+    return paths, None
+
+
+def _strictest(hits: list[tuple[str, str] | None]) -> tuple[str, str] | None:
+    out = None
+    for h in hits:
+        if h and (out is None or (h[0] == "deny" and out[0] != "deny")):
+            out = h
+    return out
+
+
 def evaluate(payload: dict):
     _BRANCH_OVERRIDE.clear()
     cwd = Path(payload.get("cwd") or ".")
@@ -639,15 +665,31 @@ def evaluate(payload: dict):
     tool_call = payload.get("toolCall")
     if isinstance(tool_call, dict):
         t_name = str(tool_call.get("name") or "")
-        args = tool_call.get("args") or {}
+        raw_args = tool_call.get("args")
+        if raw_args is not None and not isinstance(raw_args, dict):
+            return ("ask", f"{t_name} has malformed non-object arguments; the user approves (Tier 2).")
+        args = raw_args or {}
         if t_name == "run_command":
-            return check_shell(args.get("CommandLine") or args.get("command") or "", cwd)
-        if t_name in ("edit_file", "write_file", "multi_edit"):
-            return check_file_tool(args.get("Path") or args.get("file_path") or "", cwd)
-        if t_name in ("read_file", "view_file"):
-            raw = args.get("Path") or args.get("file_path") or ""
-            if raw and is_secret(norm_path(raw, cwd)):
-                return "deny", "Reading CLI credentials is never delegated."
+            raw_cmd = args.get("CommandLine") if "CommandLine" in args else args.get("command")
+            if not isinstance(raw_cmd, str) or not raw_cmd.strip():
+                return ("ask", "run_command has no recognised command string; the user approves (Tier 2).")
+            raw_cwd = args.get("Cwd") if "Cwd" in args else args.get("cwd")
+            if raw_cwd is not None and (not isinstance(raw_cwd, str) or not raw_cwd.strip()):
+                return ("ask", "run_command has a malformed Cwd; the user approves (Tier 2).")
+            cmd_cwd = norm_path(raw_cwd, cwd) if isinstance(raw_cwd, str) else cwd
+            return check_shell(raw_cmd, cmd_cwd)
+        if t_name in AGY_WRITE_TOOLS:
+            paths, err = _agy_extract_paths(args, t_name)
+            if err or paths is None:
+                return err
+            return _strictest([check_file_tool(p, cwd) for p in paths])
+        if t_name in AGY_READ_TOOLS:
+            paths, err = _agy_extract_paths(args, t_name)
+            if err or paths is None:
+                return err
+            for p in paths:
+                if is_secret(norm_path(p, cwd)):
+                    return ("deny", "Reading CLI credentials is never delegated.")
         return None
 
     # Claude Code PreToolUse format: {"tool_name": ..., "tool_input": {...}, "cwd": ...}
