@@ -5,16 +5,21 @@ Council turns **whichever coding CLI you open** — **Antigravity (`agy`)**, **C
 - **Voting Council (Cloud Subscriptions)**: The active CLI acts as Chairman and convenes the **other two** headless (`codex`, `claude`, `gemini` via `agy`) to deliberate on approaches (`consult` / `ask`) and verify changes (`review` / `gate`). Everything runs on your existing consumer subscriptions — never metered API keys.
 - **Worker Delegate (Local Ollama)**: Once the council converges on an approach, the Chairman routes well-scoped implementation tasks to a confined local **Ollama** worker (`ollama`) at zero quota cost, saving cloud dispatches for complex tasks and code review.
 
-## Modes
+## Modes & How to Invoke in Each CLI
 
-| Mode | Command | What happens |
+Each CLI uses its own skill-trigger prefix in chat:
+- **Claude Code (`claude`)**: `/council ...` (e.g., `/council check`, `/council approach <problem>`)
+- **Codex (`codex`)**: `$council ...` (e.g., `$council check`, `$council approach <problem>`, or browse via `/skills` — a leading `/` in Codex is reserved for built-in TUI commands)
+- **Antigravity (`agy`)**: `council ...` in plain text (e.g., `council check`, `council approach <problem>` — a leading `/` in `agy` is reserved for built-in slash commands)
+
+| Mode | Prompt (`/` in Claude, `$` in Codex, plain in `agy`) | What happens |
 | --- | --- | --- |
-| **Consult** | `/council approach <problem>` | Voting council proposes plans in parallel; Chairman synthesizes an adaptive task plan + worker assignments and waits for your go-ahead |
-| **Implement** | `/council implement <task>` | Runs deliberation straight into worktree task execution, cross-review, gate check, and branch merge |
-| **Ask** | `/council <question>` | Open design/architecture deliberation across the council |
-| **Task** | `/council task <what to do>` | Dispatches a worker (`ollama`, `codex`, `claude`, or `gemini`) inside an isolated `.council/worktrees/` branch |
-| **Review** | `/council review` | Voting council reviews the staged diff and runs the fail-closed `gate` |
-| **Check** | `/council check` | Reports member auth, rolling 5h/24h usage, quota cooldowns, and installed/warm Ollama models |
+| **Consult** | `council approach <problem>` | Voting council proposes plans in parallel; Chairman synthesizes an adaptive task plan + worker assignments and waits for your go-ahead |
+| **Implement** | `council implement <task>` | Runs deliberation straight into worktree task execution, cross-review, gate check, and branch merge |
+| **Ask** | `council <question>` | Open design/architecture deliberation across the council |
+| **Task** | `council task <what to do>` | Dispatches a worker (`ollama`, `codex`, `claude`, or `gemini`) inside an isolated `.council/worktrees/` branch |
+| **Review** | `council review` | Voting council reviews the staged diff and runs the fail-closed `gate` |
+| **Check** | `council check` | Reports member auth, rolling 5h/24h usage, quota cooldowns, and installed/warm Ollama models |
 
 Run artifacts live in `.council/runs/` and isolated task worktrees in `.council/worktrees/`. Add `.council/` to each repo's `.gitignore` (`task` mode refuses to run without it).
 
@@ -34,19 +39,37 @@ Run artifacts live in `.council/runs/` and isolated task worktrees in `.council/
     - `deep` (30B-A3B MoE coder leveraging fast DDR5 spillover): `ollama pull qwen3-coder:30b` (~18 GB).
     - If a configured tag isn't pulled yet, `council.py` automatically falls back to whatever coding model is installed in `ollama list`.
 
-## Install Across All Three CLIs
+## Install from GitHub Releases
 
-Link this repository once as a single source of truth into Antigravity (`~/.gemini/config/skills/council`), Claude Code (`~/.claude/skills/council`), and Codex (`~/.agents/skills/council`). On Windows, `install` uses directory junctions (`mklink /J`), which require **no Administrator privileges**:
+Download `council-<version>.zip` from [GitHub Releases](https://github.com/pcbender/council/releases), extract it, and open a terminal in the extracted folder. Run these commands on Windows, or substitute `python3` for `python` on macOS and Linux. Replace `claude` with the CLI you use to chair the council.
 
 ```powershell
-git clone https://github.com/pcbender/council
-cd council
-pip install pywinpty   # Windows only
 python scripts/council.py install
-python scripts/council.py check --chairman auto
+python "$HOME/.council/app/scripts/council.py" check --chairman claude
 ```
 
-Pass `--with-hooks` to `install` if you also want the optional `policy_gate.py` `PreToolUse` hook wired into `~/.claude/settings.json` and `~/.gemini/config/hooks.json` (`--force` replaces any earlier copied skill folders).
+The installer copies Council to `~/.council/app/`. You can delete the extracted download. It registers one skill per host in `~/.claude/skills/council`, `~/.agents/skills/council` (Codex), and `~/.gemini/config/skills/council` (Antigravity). Use `--target claude`, `--target codex`, or `--target gemini` for a subset. Windows uses per-user directory junctions. Council migrates identifiable legacy Codex links and reports conflicting user-managed paths. If you have inspected a reported dangling link, use `install --force` to repair it.
+
+Sign in to your chair and at least one voting peer before running `check`. Start a new session in your project and try a Council Ask to confirm the peer can answer. `check` lists missing peers, quota cooldowns, and optional Ollama availability. Git supports repository operations such as task worktrees and staged reviews.
+
+Put personal settings in `~/.council/council.config.json` to preserve them across releases. Use `--with-hooks` on `install` to enable the optional policy hooks for Claude Code and Antigravity. If you already enabled Council hooks in a linked checkout, the installer can repair their paths during migration.
+
+### Update or uninstall
+
+```powershell
+python "$HOME/.council/app/scripts/council.py" update
+python "$HOME/.council/app/scripts/council.py" uninstall
+```
+
+`update` checks the latest stable GitHub Release, verifies its ZIP against GitHub's SHA-256 asset digest, and uses the same staged installer. You can also download and install a newer ZIP manually. `uninstall` removes the Council-owned app, links, and hooks and preserves your config and history. If Windows is using an installed file and blocks a replacement, close the session using it and retry.
+
+### Develop or build a release
+
+From a contributor checkout, run `python scripts/council.py install --link` to keep the skills pointed at the checkout. For a release, set `VERSION`, build the archive, and upload the ZIP and checksum as GitHub Release assets under the matching `v<version>` tag.
+
+```powershell
+python scripts/council.py build-release --output dist
+```
 
 Run the test suite with:
 

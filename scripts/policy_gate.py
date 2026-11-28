@@ -119,8 +119,14 @@ def is_secret(path: Path) -> bool:
 def is_config(path: Path) -> bool:
     lowered = parts_lower(path)
     name = path.name.lower()
+    state = Path.home().resolve() / ".council"
+    try:
+        managed = tuple(part.lower() for part in path.resolve().relative_to(state).parts[:1])
+    except (OSError, ValueError, RuntimeError):
+        managed = None
     return (name in CONFIG_NAMES or name.startswith(".env") or any(d in lowered for d in CONFIG_DIRS)
             or (".git" in lowered and "hooks" in lowered)
+            or managed in {(), ("app",), ("app.previous",), ("install.json",)}
             or (name == "config" and lowered[-2:-1] == [".git"]))
 
 
@@ -563,6 +569,10 @@ def check_segment(segment: str, cwd: Path, command: str, depth: int = 0):
         for w in lowered:
             if any(flag in w for flag in NEVER_FLAGS):
                 return "deny", "Sandbox-bypass flags remove the members' fence; the policy never allows them."
+    if head in ("py", "council.py") or head.startswith("python"):
+        for word, action in zip(lowered, lowered[1:]):
+            if base_name(word) == "council.py" and action in ("install", "update", "uninstall"):
+                return "ask", "Changing the user's Council installation needs approval (Tier 2)."
 
     for w in words[1:]:
         if not w.startswith("-") and is_secret(norm_path(w, cwd)):
@@ -706,7 +716,7 @@ def evaluate(payload: dict):
 
 def main() -> int:
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(sys.stdin.read().lstrip("\ufeff"))
     except (json.JSONDecodeError, ValueError):
         return 0
     if not isinstance(payload, dict):

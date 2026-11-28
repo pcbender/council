@@ -119,10 +119,14 @@ class RosterStateAndInstallTest(unittest.TestCase):
     def test_cross_cli_installer_links_and_hooks(self):
         fake_home = self.root / "home"
         fake_home.mkdir()
-        args = argparse.Namespace(with_hooks=True, force=False, home=str(fake_home))
+        args = argparse.Namespace(cmd="install", link=True, with_hooks=True, force=False, home=str(fake_home))
+        def install():
+            return council.council_install.run(args, council.SKILL_ROOT, council._file_lock,
+                                               council._write_utf8_atomic, council.DEFAULT_CONFIG)
+
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = council.cmd_install(args, council.load_config())
+            code = install()
         self.assertEqual(code, 0, out.getvalue())
 
         for rel in (".gemini/config/skills/council", ".claude/skills/council", ".agents/skills/council"):
@@ -138,13 +142,13 @@ class RosterStateAndInstallTest(unittest.TestCase):
 
         # Re-running install is idempotent
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(council.cmd_install(args, council.load_config()), 0)
+            self.assertEqual(install(), 0)
 
         # Malformed settings.json is preserved untouched rather than overwritten
         corrupt = fake_home / ".claude" / "settings.json"
         corrupt.write_text("{not valid json // user comment", encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(council.cmd_install(args, council.load_config()), 1)
+            self.assertEqual(install(), 1)
         self.assertEqual(corrupt.read_text(encoding="utf-8"), "{not valid json // user comment")
 
 
