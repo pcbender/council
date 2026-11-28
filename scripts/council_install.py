@@ -86,10 +86,6 @@ def _release_files(source: Path) -> set[str]:
     files = set(RELEASE_FILES)
     if (source / "LICENSE").is_file():
         files.add("LICENSE")
-    for script in (source / "scripts").rglob("*.py"):
-        name = script.relative_to(source).as_posix()
-        if _script_name(name) and not _is_reparse(script):
-            files.add(name)
     return files
 
 
@@ -312,10 +308,14 @@ def _transaction():
         rollback.pop_all()
 
 
-def _write_json(path: Path, data: dict, write, rollback) -> None:
+def _write_json(path: Path, data: dict, write, rollback, *, expected: str | None = None) -> None:
     if _is_reparse(path):
         raise ValueError(f"Preserving a linked settings or ownership file at {path}")
     previous = path.read_text(encoding="utf-8") if _exists(path) else None
+    if expected is not None:
+        current = json.loads(previous.lstrip("\ufeff")) if previous is not None else {}
+        if json.dumps(current) != expected:
+            raise ValueError(f"Council settings changed during installation at {path}. Retry the command.")
     write(path, json.dumps(data, indent=2) + "\n", preserve_mode=True)
     if previous is None:
         rollback.callback(path.unlink)
@@ -366,16 +366,19 @@ class Installation:
         if Path.cwd().resolve().is_relative_to(self.app):
             os.chdir(self.state)
 
-    def _change_app(self, candidate: Path | None, rollback) -> None:
+    def _change_app(self, candidate: Path | None, rollback) -> Path | None:
         self._leave_app()
+        backup = None
         if _exists(self.app):
             if not self.managed or _is_reparse(self.app) or not self.app.is_dir():
                 raise ValueError(f"Preserving an unowned installation path: {self.app}")
-            self.app.rename(self.previous)
-            rollback.callback(self.previous.rename, self.app)
+            backup = self.previous if candidate is not None else self.state / f".app-retired-{uuid.uuid4().hex}"
+            self.app.rename(backup)
+            rollback.callback(backup.rename, self.app)
         if candidate is not None:
             candidate.rename(self.app)
             rollback.callback(self.app.rename, candidate)
+        return backup if candidate is None else None
 
     def _managed_version(self, payload: Path) -> str | None:
         if _is_reparse(payload) or not _council_checkout(payload):
@@ -434,17 +437,27 @@ class Installation:
             raise ValueError("Run install --link from the contributor checkout")
         selected = self.hosts | (hosts or self.hosts or set(HOST_PATHS))
         destinations = {host: self.home / HOST_PATHS[host] for host in sorted(selected)}
-        legacy = self._legacy_paths() - set(destinations.values()) if "codex" in selected else set()
+        legacy = set()
+        if "codex" in selected:
+            active_entries = {path.parent.resolve() / path.name for path in destinations.values()}
+            legacy = {path.parent.resolve() / path.name for path in self._legacy_paths()} - active_entries
         roots = {source, target}
         if self.target is not None:
             roots.add(self.target)
         old_links = {path: _link_target(path) for path in (*destinations.values(), *sorted(legacy))}
         previous_roots = {old for old in old_links.values() if old and old != self.app and _council_checkout(old)}
         roots.update(previous_roots)
+        hooks, hook_edits = self._plan_hooks(target, roots, selected, hosts, with_hooks)
+        record = {"schema": 1, "mode": "managed" if candidate else "link", "target": str(target),
+                  "version": version, "hosts": sorted(selected), "hooks": hooks}
+        retired = None
         with _transaction() as rollback:
             if candidate is not None:
+                self._migrate_config(sorted(previous_roots), source, candidate, rollback)
+                if not self.data and not _exists(self.app):
+                    # An interrupted first install can already identify its payload as managed.
+                    _write_json(self.record, record, self.write, rollback)
                 self._change_app(candidate, rollback)
-            self._migrate_config(candidate is not None, sorted(previous_roots), source, target, rollback)
             for path in destinations.values():
                 old = old_links[path]
                 if _exists(path) and old not in roots:
@@ -467,18 +480,19 @@ class Installation:
                     rollback.callback(_make_link, path, old)
                 elif _exists(path):
                     print(f"Preserving legacy Codex skill path {path}; inspect it if Council appears twice.", file=sys.stderr)
-            hooks = self._install_hooks(target, roots, selected, hosts, with_hooks, rollback)
+            for path, data, expected in hook_edits:
+                _write_json(path, data, self.write, rollback, expected=expected)
             if candidate is None and self.managed:
-                self._change_app(None, rollback)
-            _write_json(self.record, {"schema": 1, "mode": "managed" if candidate else "link",
-                        "target": str(target), "version": version, "hosts": sorted(selected), "hooks": hooks},
-                        self.write, rollback)
+                retired = self._change_app(None, rollback)
+            _write_json(self.record, record, self.write, rollback)
         self._finish_app()
+        if retired is not None:
+            self._remove_retired(retired)
         for host, path in destinations.items():
             print(f"{host}: {path} -> {target}")
 
-    def _migrate_config(self, managed: bool, roots: list[Path], source: Path, target: Path, rollback) -> None:
-        if not managed or self.managed or _exists(self.overrides):
+    def _migrate_config(self, roots: list[Path], source: Path, candidate: Path, rollback) -> None:
+        if self.managed or _exists(self.overrides):
             return
         for root in roots:
             old = root / "council.config.json"
@@ -490,15 +504,16 @@ class Installation:
                 else:
                     overrides = _config_overrides(values, self.defaults)
                     if root != source:
-                        overrides = _config_overrides(overrides, _read_object(target / "council.config.json"))
+                        overrides = _config_overrides(overrides, _read_object(candidate / "council.config.json"))
                 if overrides:
                     _write_json(self.overrides, overrides, self.write, rollback)
                     print(f"Migrated settings from {old} to {self.overrides}: {', '.join(sorted(overrides))}")
                 return
 
-    def _install_hooks(self, target: Path, roots: set[Path], selected: set[str], hosts: set[str],
-                       with_hooks: bool, rollback) -> dict:
+    def _plan_hooks(self, target: Path, roots: set[Path], selected: set[str], hosts: set[str],
+                    with_hooks: bool) -> tuple[dict, list[tuple[Path, dict, str]]]:
         hooks = {}
+        edits = []
         legacy = _legacy_commands(roots)
         command = _hook_command(target)
         for host, relative in HOOK_PATHS.items():
@@ -519,14 +534,15 @@ class Installation:
                 continue
             if changed:
                 if json.dumps(data) != previous:
-                    _write_json(path, data, self.write, rollback)
+                    edits.append((path, data, previous))
                 hooks[host] = command
-        return hooks
+        return hooks, edits
 
     def uninstall(self) -> None:
         if not self.data:
             print("Council has no recorded installation.")
             return
+        retired = None
         with _transaction() as rollback:
             for host, command in self.hooks.items():
                 path = self.home / HOOK_PATHS[host]
@@ -542,9 +558,10 @@ class Installation:
                 elif _exists(path):
                     print(f"Preserving skill path that no longer points to Council: {path}", file=sys.stderr)
             if self.managed:
-                self._change_app(None, rollback)
+                retired = self._change_app(None, rollback)
             self.record.unlink()
-        self._finish_app()
+        if retired is not None:
+            self._remove_retired(retired)
         print("Council registrations removed. User settings and history are preserved.")
 
 

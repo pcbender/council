@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,60 @@ class DistributionTest(unittest.TestCase):
             self.assertEqual(self.managed("install")[0], 0)
         self.assertEqual((self.home / installer.HOST_PATHS["codex"]).resolve(), self.app)
 
+    def test_legacy_codex_parent_alias_cannot_retire_the_canonical_link(self):
+        canonical = self.home / installer.HOST_PATHS["codex"]
+        canonical.parent.mkdir(parents=True)
+        installer._make_link(self.home / ".codex/skills", canonical.parent)
+        for _ in range(2):
+            code, message = self.managed("install", target=["codex"])
+            self.assertEqual(code, 0, message)
+            self.assertEqual(canonical.resolve(), self.app)
+
+    def test_failed_first_install_clears_prepared_ownership_record(self):
+        blocker = self.home / installer.HOST_PATHS["codex"]
+        blocker.mkdir(parents=True)
+        self.assertEqual(self.managed("install", target=["codex"])[0], 1)
+        self.assertTrue(blocker.is_dir())
+        self.assertFalse((self.state / "install.json").exists())
+        self.assertFalse(self.app.exists())
+
+    def test_first_install_prepares_config_and_hooks_before_activating(self):
+        old = self.root / "Previous Checkout"
+        installer._unpack_release(self.bundle("1.0.0", "old-copy").read_bytes(), old, "1.0.0")
+        (old / "council.config.json").write_text('{"timeout_seconds": 91}', encoding="utf-8")
+        entry = self.home / installer.HOST_PATHS["claude"]
+        installer._make_link(entry, old)
+
+        def interrupt(installation, candidate, rollback):
+            self.assertTrue(candidate.is_dir())
+            self.assertEqual(council.load_config(self.home)["timeout_seconds"], 91)
+            record = json.loads((self.state / "install.json").read_text())
+            self.assertEqual(set(record["hooks"]), {"claude"})
+            raise PermissionError("interrupted before activation")
+
+        with patch.object(installer.Installation, "_change_app", interrupt):
+            result = self.managed("install", target=["claude"], with_hooks=True)
+            self.assertIn("interrupted before activation", result[1])
+        self.assertFalse((self.state / "install.json").exists())
+        self.assertFalse((self.state / "council.config.json").exists())
+        self.assertEqual(entry.resolve(), old)
+
+    def test_retired_files_do_not_block_install_after_uninstall(self):
+        self.assertEqual(self.managed("install", target=["codex"])[0], 0)
+        remove = shutil.rmtree
+
+        def retained(path, *args, **kwargs):
+            if Path(path).name.startswith(".app-retired-"):
+                raise PermissionError("retired files in use")
+            return remove(path, *args, **kwargs)
+
+        with patch.object(shutil, "rmtree", retained):
+            code, message = self.managed("uninstall", self.app)
+        self.assertEqual(code, 0, message)
+        self.assertIn("retired files in use", message)
+        self.assertFalse((self.state / "app.previous").exists())
+        self.assertEqual(self.managed("install", target=["codex"])[0], 0)
+
     def test_update_checksum_rollback_and_user_state(self):
         initial = self.root / "Initial Release"
         installer._unpack_release(self.bundle("1.0.0", "first").read_bytes(), initial, "1.0.0")
@@ -224,11 +279,15 @@ class DistributionTest(unittest.TestCase):
         installer._unpack_release(self.bundle("2.0.0", "base").read_bytes(), source, "2.0.0")
         module = source / "scripts" / "next_module.py"
         module.write_text("VALUE = 1\n")
-        archive = installer.build_release(source, self.root / "next", None)
+        ordinary = installer.build_release(source, self.root / "ordinary", None)
+        with zipfile.ZipFile(ordinary) as archive:
+            self.assertNotIn("scripts/next_module.py", archive.namelist())
+        with patch.object(installer, "RELEASE_FILES", (*installer.RELEASE_FILES, "scripts/next_module.py")):
+            archive = installer.build_release(source, self.root / "next", None)
+            self.assertEqual(self.managed("install", source, target=["codex"])[0], 0)
         installer._unpack_release(archive.read_bytes(), self.root / "decoded", "2.0.0")
         self.assertTrue((self.root / "decoded/scripts/next_module.py").is_file())
 
-        self.assertEqual(self.managed("install", source, target=["codex"])[0], 0)
         previous = self.state / "app.previous"
         self.app.rename(previous)
         args = dict(target=["codex"])
